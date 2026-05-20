@@ -1,6 +1,8 @@
 import os
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
+import cv2
+import numpy as np
 
 # Fallback font list (used if the user's chosen font is not found)
 FALLBACK_FONTS = [
@@ -37,8 +39,6 @@ def get_font(size, font_name=None):
 def wrap_text(text, font, max_width):
     """Simple text wrapping."""
     lines = []
-    # If the font does not have getbbox, use getsize (older Pillow)
-    # Pillow 10+ requires getbbox or getlength
     words = text.split()
     if not words:
         return []
@@ -66,19 +66,45 @@ def wrap_text(text, font, max_width):
 
 def is_dark(color):
     """Returns True if the background color is dark, so text should be white."""
-    # Using luminance formula
     r, g, b = color
+    # Using relative luminance formula
     luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
     return luminance < 0.5
 
+def inpaint_text_regions(image, box_infos):
+    """
+    Uses OpenCV's Fast Marching method to erase original text regions,
+    synthesizing and blending texture organically from surrounding pixels.
+    """
+    try:
+        # Convert PIL RGB to OpenCV BGR
+        cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        mask = np.zeros(cv_img.shape[:2], dtype=np.uint8)
+        
+        for info in box_infos:
+            # Pad mask slightly (3px) to fully cover text outlines and anti-aliasing edges
+            pad = 3
+            x0 = max(0, int(info["x_min"]) - pad)
+            y0 = max(0, int(info["y_min"]) - pad)
+            x1 = min(cv_img.shape[1], int(info["x_max"]) + pad)
+            y1 = min(cv_img.shape[0], int(info["y_max"]) + pad)
+            
+            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+            
+        # Run inpainting
+        inpainted = cv2.inpaint(cv_img, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        
+        # Convert back to PIL Image RGB
+        return Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB))
+    except Exception as e:
+        print(f"OpenCV Inpainting failed, falling back to original background: {e}")
+        return image
+
 def create_overlay(image, extracted_data, font_name=None):
     """
-    Overlays translated text on the image.
-    extracted_data contains list of dicts: bbox, text, background_color
-    font_name: optional font name/path to use
+    Overlays translated text on the image using inpainting, size bucketing, and text strokes.
     """
     img_copy = image.copy()
-    draw = ImageDraw.Draw(img_copy)
     
     # ── Pass 1: Calculate the maximum font size that fits each box ──
     box_infos = []
@@ -121,38 +147,84 @@ def create_overlay(image, extracted_data, font_name=None):
             "fitted_font_size": max(font_size, 8)
         })
     
-    # ── Normalize: use the smallest fitted font size for all boxes ──
     if not box_infos:
-        pass  # nothing to draw
-    else:
-        unified_size = min(info["fitted_font_size"] for info in box_infos)
-        unified_font = get_font(unified_size, font_name)
+        # Save and return as-is if no text is found
+        os.makedirs("translated", exist_ok=True)
+        filepath = os.path.join("translated", datetime.now().strftime("%Y-%m-%d_%H-%M-%S.png"))
+        img_copy.save(filepath)
+        return filepath
         
-        if hasattr(unified_font, 'getbbox'):
-            line_height = unified_font.getbbox("A")[3] - unified_font.getbbox("A")[1]
-        else:
-            line_height = unified_font.getsize("A")[1]
+    # ── OpenCV Inpainting: Organic texture erasure of original text ──
+    img_copy = inpaint_text_regions(img_copy, box_infos)
+    draw = ImageDraw.Draw(img_copy)
     
-        # ── Pass 2: Draw with the unified font size ──
-        for info in box_infos:
-            # Draw background rectangle
-            draw.rectangle([info["x_min"], info["y_min"], info["x_max"], info["y_max"]], fill=info["bg_color"])
+    # ── Pass 2: Normalize sizes by bucketing to preserve visual hierarchy ──
+    large_group = [info for info in box_infos if info["fitted_font_size"] >= 20]
+    medium_group = [info for info in box_infos if 13 <= info["fitted_font_size"] < 20]
+    small_group = [info for info in box_infos if info["fitted_font_size"] < 13]
+    
+    unified_large = min(info["fitted_font_size"] for info in large_group) if large_group else 0
+    unified_medium = min(info["fitted_font_size"] for info in medium_group) if medium_group else 0
+    unified_small = min(info["fitted_font_size"] for info in small_group) if small_group else 0
+    
+    # Enforce hierarchical constraints (Large >= Medium >= Small)
+    if unified_medium < unified_small:
+        unified_medium = max(unified_medium, unified_small)
+    if unified_large < unified_medium:
+        unified_large = max(unified_large, unified_medium)
+        
+    for info in large_group:
+        info["unified_font_size"] = unified_large
+    for info in medium_group:
+        info["unified_font_size"] = unified_medium
+    for info in small_group:
+        info["unified_font_size"] = unified_small
+        
+    # ── Pass 3: Draw text overlays with custom dynamic strokes ──
+    for info in box_infos:
+        font_size = info["unified_font_size"]
+        font = get_font(font_size, font_name)
+        
+        if hasattr(font, 'getbbox'):
+            line_height = font.getbbox("A")[3] - font.getbbox("A")[1]
+        else:
+            line_height = font.getsize("A")[1]
             
-            # Determine text color based on background
-            text_color = (255, 255, 255) if is_dark(info["bg_color"]) else (0, 0, 0)
+        lines = wrap_text(info["text"], font, info["width"])
+        total_height = line_height * len(lines)
+        y_offset = info["y_min"] + max(0, (info["height"] - total_height) // 2)
+        
+        # Decide colors based on local background luminance
+        is_dark_bg = is_dark(info["bg_color"])
+        text_color = (255, 255, 255) if is_dark_bg else (0, 0, 0)
+        stroke_color = (0, 0, 0) if is_dark_bg else (255, 255, 255)
+        
+        # Dynamically scale stroke width relative to the active font size
+        if font_size < 12:
+            stroke_w = 1
+        elif font_size < 24:
+            stroke_w = 2
+        else:
+            stroke_w = 3
             
-            lines = wrap_text(info["text"], unified_font, info["width"])
-            total_height = line_height * len(lines)
-            y_offset = info["y_min"] + max(0, (info["height"] - total_height) // 2)
+        for line in lines:
+            if hasattr(font, 'getbbox'):
+                line_width = font.getbbox(line)[2]
+            else:
+                line_width = font.getsize(line)[0]
+                
+            x_offset = info["x_min"] + max(0, (info["width"] - line_width) // 2)
             
-            for line in lines:
-                if hasattr(unified_font, 'getbbox'):
-                    line_width = unified_font.getbbox(line)[2]
-                else:
-                    line_width = unified_font.getsize(line)[0]
-                x_offset = info["x_min"] + max(0, (info["width"] - line_width) // 2)
-                draw.text((x_offset, y_offset), line, font=unified_font, fill=text_color)
-                y_offset += line_height
+            # Render text with contrasting strokes to guarantee legibility
+            draw.text(
+                (x_offset, y_offset),
+                line,
+                font=font,
+                fill=text_color,
+                stroke_width=stroke_w,
+                stroke_fill=stroke_color
+            )
+            y_offset += line_height
             
     # Save the file
     os.makedirs("translated", exist_ok=True)
