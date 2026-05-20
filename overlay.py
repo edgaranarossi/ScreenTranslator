@@ -83,14 +83,20 @@ def inpaint_text_regions(image, box_infos):
         mask = np.zeros(cv_img.shape[:2], dtype=np.uint8)
         
         for info in box_infos:
-            # Pad mask slightly (3px) to fully cover text outlines and anti-aliasing edges
-            pad = 3
-            x0 = max(0, int(info["x_min"]) - pad)
-            y0 = max(0, int(info["y_min"]) - pad)
-            x1 = min(cv_img.shape[1], int(info["x_max"]) + pad)
-            y1 = min(cv_img.shape[0], int(info["y_max"]) + pad)
-            
-            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+            # Pad mask slightly (5px) to fully cover text outlines and anti-aliasing edges
+            pad = 5
+            for obox in info.get("original_bboxes", [info["bbox"]]):
+                x_min_o = min(p[0] for p in obox)
+                x_max_o = max(p[0] for p in obox)
+                y_min_o = min(p[1] for p in obox)
+                y_max_o = max(p[1] for p in obox)
+                
+                x0 = max(0, int(x_min_o) - pad)
+                y0 = max(0, int(y_min_o) - pad)
+                x1 = min(cv_img.shape[1], int(x_max_o) + pad)
+                y1 = min(cv_img.shape[0], int(y_max_o) + pad)
+                
+                cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
             
         # Run inpainting
         inpainted = cv2.inpaint(cv_img, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
@@ -174,6 +180,7 @@ def create_overlay(image, extracted_data, font_name=None):
         
         box_infos.append({
             "bbox": bbox,
+            "original_bboxes": item.get("original_bboxes", [bbox]),
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "width": width, "height": height,
             "text": text, "bg_color": bg_color,
@@ -303,7 +310,7 @@ def create_overlay(image, extracted_data, font_name=None):
                 else:
                     line_width = font.getsize(line)[0]
                     
-                x_offset = base_x + max(0, (width - line_width) // 2)
+                x_offset = base_x + (width - line_width) // 2
                 
                 # Draw segments
                 x_cursor = x_offset
@@ -324,15 +331,29 @@ def create_overlay(image, extracted_data, font_name=None):
 
         # Render rotated vs normal
         if abs(angle) < 2.0:
-            y_start = info["y_min"] + max(0, (height - total_height) // 2)
+            y_start = info["y_min"] + (height - total_height) // 2
             draw_lines_on_canvas(draw, info["x_min"], y_start)
         else:
             # Render to transparent temporary canvas
-            txt_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            # Find the maximum width among all wrapped lines to define canvas width
+            line_widths = []
+            for line in lines:
+                if hasattr(font, 'getbbox'):
+                    w = font.getbbox(line)[2]
+                else:
+                    w = font.getsize(line)[0]
+                line_widths.append(w)
+            max_line_w = max(line_widths) if line_widths else width
+            
+            canvas_w = max(width, max_line_w)
+            canvas_h = max(height, total_height)
+            
+            txt_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
             txt_draw = ImageDraw.Draw(txt_img)
             
-            y_start = max(0, (height - total_height) // 2)
-            draw_lines_on_canvas(txt_draw, 0, y_start)
+            base_x = (canvas_w - width) // 2
+            y_start = (canvas_h - total_height) // 2
+            draw_lines_on_canvas(txt_draw, base_x, y_start)
             
             # Rotate temporary image
             rotated_txt_img = txt_img.rotate(-angle, resample=Image.Resampling.BICUBIC, expand=True)
