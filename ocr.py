@@ -227,11 +227,21 @@ def _extract_windows_ocr(img, img_np, source_language):
             
         x_min, x_max = min(x_coords), max(x_coords)
         y_min, y_max = min(y_coords), max(y_coords)
+        
+        # Clamp to image boundaries
+        x_min = max(0, min(int(x_min), img.width))
+        x_max = max(0, min(int(x_max), img.width))
+        y_min = max(0, min(int(y_min), img.height))
+        y_max = max(0, min(int(y_max), img.height))
+        
+        if x_max <= x_min or y_max <= y_min:
+            continue
+        
         bbox = [
-            [int(x_min), int(y_min)],
-            [int(x_max), int(y_min)],
-            [int(x_max), int(y_max)],
-            [int(x_min), int(y_max)]
+            [x_min, y_min],
+            [x_max, y_min],
+            [x_max, y_max],
+            [x_min, y_max]
         ]
         
         bg_color = get_dominant_color(img, bbox)

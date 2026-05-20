@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
 import config
 import capture
 import mss
@@ -150,10 +151,10 @@ class SettingsGUI(tk.Tk):
         _app_instance = self
         
         self.title("ScreenTranslator Settings")
-        # Comfortably fits all visual cards without scrollbars
-        self.geometry("420x620")
+        self.geometry("920x620")
         self.configure(bg=BG_MAIN)
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(700, 500)
         
         self.on_save_callback = on_save_callback
         self.on_recapture_callback = on_recapture_callback
@@ -161,9 +162,20 @@ class SettingsGUI(tk.Tk):
         
         self.cfg = config.load_config()
         
+        # Preview state
+        self._orig_pil = None       # Original captured PIL image
+        self._proc_pil = None       # Processed overlay PIL image
+        self._orig_display = None   # Scaled original for canvas
+        self._proc_display = None   # Scaled processed for canvas
+        self._orig_tk = None        # ImageTk reference (prevent GC)
+        self._proc_tk = None
+        self._split_x = 0.5         # Split position as ratio 0..1
+        self._dragging = False
+        
         self._apply_modern_theme()
         self._create_widgets()
         self._load_values()
+        self._draw_placeholder()
         
     def _apply_modern_theme(self):
         """Configure standard TTK styles to match modern Dark Mode palette."""
@@ -210,8 +222,23 @@ class SettingsGUI(tk.Tk):
         self.option_add("*TCombobox*Listbox.borderWidth", "0")
 
     def _create_widgets(self):
-        # Outer padding container
-        main_frame = ttk.Frame(self, padding="15")
+        # ── Master horizontal split container ──
+        master = tk.Frame(self, bg=BG_MAIN)
+        master.pack(fill="both", expand=True)
+        
+        # LEFT PANEL: Settings (fixed width)
+        left_panel = tk.Frame(master, bg=BG_MAIN, width=400)
+        left_panel.pack(side="left", fill="y")
+        left_panel.pack_propagate(False)
+        
+        # RIGHT PANEL: Preview canvas (expandable)
+        right_panel = tk.Frame(master, bg=BG_CARD)
+        right_panel.pack(side="right", fill="both", expand=True)
+        
+        self._build_preview_panel(right_panel)
+        
+        # Outer padding container inside the left panel
+        main_frame = ttk.Frame(left_panel, padding="15")
         main_frame.pack(fill="both", expand=True)
         
         # --- HEADER SECTION ---
@@ -221,7 +248,7 @@ class SettingsGUI(tk.Tk):
         title_lbl = tk.Label(header_frame, text="SCREEN TRANSLATOR", bg=BG_MAIN, fg=ACCENT_COLOR, font=(FONT_FAMILY, 14, "bold"))
         title_lbl.pack(anchor="w")
         
-        sub_lbl = tk.Label(header_frame, text="v2.1 • Local LLM OCR & Translation", bg=BG_MAIN, fg=TEXT_MUTED, font=(FONT_FAMILY, 9))
+        sub_lbl = tk.Label(header_frame, text="v2.2 • Local LLM OCR & Translation", bg=BG_MAIN, fg=TEXT_MUTED, font=(FONT_FAMILY, 9))
         sub_lbl.pack(anchor="w", pady=(2, 5))
         
         sep_line = tk.Frame(header_frame, bg=ACCENT_COLOR, height=2)
@@ -447,6 +474,221 @@ class SettingsGUI(tk.Tk):
         if self.on_save_callback:
             self.on_save_callback(self.cfg)
 
+    # ─── Preview Panel ─────────────────────────────────────────────────
+    
+    def _build_preview_panel(self, parent):
+        """Build the right-side preview canvas with wipe comparison."""
+        # Header label
+        hdr = tk.Frame(parent, bg=BG_CARD)
+        hdr.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(hdr, text="Preview", bg=BG_CARD, fg=TEXT_MAIN, font=(FONT_FAMILY, 10, "bold")).pack(side="left")
+        self._status_lbl = tk.Label(hdr, text="No capture yet", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8))
+        self._status_lbl.pack(side="right")
+        
+        # Canvas
+        self._canvas = tk.Canvas(parent, bg="#111113", highlightthickness=0, cursor="sb_h_double_arrow")
+        self._canvas.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        
+        # Bindings
+        self._canvas.bind("<Motion>", self._on_canvas_motion)
+        self._canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self._canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+    
+    def _draw_placeholder(self):
+        """Draw an elegant placeholder when no capture exists."""
+        self._canvas.delete("all")
+        self._canvas.update_idletasks()
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            cw, ch = 480, 580
+        
+        cx, cy = cw // 2, ch // 2
+        
+        # Dashed border rectangle
+        pad = 30
+        self._canvas.create_rectangle(
+            pad, pad, cw - pad, ch - pad,
+            outline="#3f3f46", width=2, dash=(8, 4)
+        )
+        
+        # Icon-like viewfinder crosshair
+        sz = 20
+        self._canvas.create_line(cx - sz, cy, cx + sz, cy, fill="#52525b", width=2)
+        self._canvas.create_line(cx, cy - sz, cx, cy + sz, fill="#52525b", width=2)
+        self._canvas.create_oval(cx - sz, cy - sz, cx + sz, cy + sz, outline="#52525b", width=2)
+        
+        self._canvas.create_text(
+            cx, cy + 50,
+            text="No Screen Capture Yet",
+            fill=TEXT_MUTED, font=(FONT_FAMILY, 11, "bold")
+        )
+        self._canvas.create_text(
+            cx, cy + 75,
+            text="Use the Capture button or press your hotkey",
+            fill="#52525b", font=(FONT_FAMILY, 9)
+        )
+    
+    def _resize_preview_images(self):
+        """Scale both images to fit the current canvas size, preserving aspect ratio."""
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        
+        if self._orig_pil:
+            self._orig_display = self._fit_image(self._orig_pil, cw, ch)
+            self._orig_tk = ImageTk.PhotoImage(self._orig_display)
+        if self._proc_pil:
+            self._proc_display = self._fit_image(self._proc_pil, cw, ch)
+            self._proc_tk = ImageTk.PhotoImage(self._proc_display)
+    
+    def _fit_image(self, pil_img, max_w, max_h):
+        """Return a copy of pil_img scaled to fit inside max_w x max_h."""
+        iw, ih = pil_img.size
+        scale = min(max_w / iw, max_h / ih)
+        new_w = max(1, int(iw * scale))
+        new_h = max(1, int(ih * scale))
+        return pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    def _draw_split(self):
+        """Draw the wipe comparison on the canvas."""
+        self._canvas.delete("all")
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        
+        # If we only have the original (capture done, processing pending)
+        if self._orig_tk and not self._proc_tk:
+            # Center the original image
+            iw, ih = self._orig_display.size
+            ox = (cw - iw) // 2
+            oy = (ch - ih) // 2
+            self._canvas.create_image(ox, oy, anchor="nw", image=self._orig_tk)
+            # Pulsing status text at the bottom
+            self._canvas.create_text(
+                cw // 2, ch - 16,
+                text="⏳ Translating...",
+                fill=ACCENT_COLOR, font=(FONT_FAMILY, 9, "bold")
+            )
+            return
+        
+        # Full wipe comparison mode
+        if not self._orig_tk or not self._proc_tk:
+            self._draw_placeholder()
+            return
+        
+        iw, ih = self._orig_display.size
+        ox = (cw - iw) // 2
+        oy = (ch - ih) // 2
+        
+        # Split pixel position within the image
+        split_px = int(self._split_x * iw)
+        split_px = max(0, min(split_px, iw))
+        
+        # Left side: processed (translated)
+        if split_px > 0:
+            left_crop = self._proc_display.crop((0, 0, split_px, ih))
+            self._left_tk = ImageTk.PhotoImage(left_crop)
+            self._canvas.create_image(ox, oy, anchor="nw", image=self._left_tk)
+        
+        # Right side: original
+        if split_px < iw:
+            right_crop = self._orig_display.crop((split_px, 0, iw, ih))
+            self._right_tk = ImageTk.PhotoImage(right_crop)
+            self._canvas.create_image(ox + split_px, oy, anchor="nw", image=self._right_tk)
+        
+        # Draw the split line
+        line_x = ox + split_px
+        self._canvas.create_line(
+            line_x, oy, line_x, oy + ih,
+            fill=ACCENT_COLOR, width=3
+        )
+        
+        # Draw handle circle at center of line
+        handle_y = oy + ih // 2
+        r = 12
+        self._canvas.create_oval(
+            line_x - r, handle_y - r, line_x + r, handle_y + r,
+            fill=ACCENT_COLOR, outline="white", width=2
+        )
+        # Arrow hints inside the handle
+        self._canvas.create_text(
+            line_x, handle_y,
+            text="◀▶", fill="white", font=(FONT_FAMILY, 7, "bold")
+        )
+        
+        # Labels
+        self._canvas.create_text(
+            ox + 8, oy + 8, anchor="nw",
+            text="Translated", fill=ACCENT_COLOR, font=(FONT_FAMILY, 8, "bold")
+        )
+        self._canvas.create_text(
+            ox + iw - 8, oy + 8, anchor="ne",
+            text="Original", fill=TEXT_MUTED, font=(FONT_FAMILY, 8, "bold")
+        )
+    
+    def _canvas_x_to_split(self, event_x):
+        """Convert a canvas x coordinate to a split ratio."""
+        if not self._orig_display:
+            return 0.5
+        cw = self._canvas.winfo_width()
+        iw, _ = self._orig_display.size
+        ox = (cw - iw) // 2
+        rel = (event_x - ox) / iw
+        return max(0.0, min(1.0, rel))
+    
+    def _on_canvas_motion(self, event):
+        """Update split on hover when both images are loaded."""
+        if self._orig_tk and self._proc_tk and not self._dragging:
+            self._split_x = self._canvas_x_to_split(event.x)
+            self._draw_split()
+    
+    def _on_canvas_press(self, event):
+        if self._orig_tk and self._proc_tk:
+            self._dragging = True
+            self._split_x = self._canvas_x_to_split(event.x)
+            self._draw_split()
+    
+    def _on_canvas_drag(self, event):
+        if self._dragging and self._orig_tk and self._proc_tk:
+            self._split_x = self._canvas_x_to_split(event.x)
+            self._draw_split()
+    
+    def _on_canvas_release(self, event):
+        self._dragging = False
+    
+    def _on_canvas_resize(self, event):
+        """Re-scale images and redraw on window resize."""
+        if self._orig_pil:
+            self._resize_preview_images()
+            self._draw_split()
+        else:
+            self._draw_placeholder()
+    
+    def set_preview(self, src_path, proc_path):
+        """Load preview images. Called from the main thread via after()."""
+        try:
+            if src_path:
+                self._orig_pil = Image.open(src_path).convert("RGB")
+            if proc_path:
+                self._proc_pil = Image.open(proc_path).convert("RGB")
+                self._split_x = 0.5
+                self._status_lbl.configure(text="Drag to compare")
+            else:
+                self._proc_pil = None
+                self._proc_display = None
+                self._proc_tk = None
+                self._status_lbl.configure(text="Processing...")
+            
+            self._resize_preview_images()
+            self._draw_split()
+        except Exception as e:
+            print(f"Preview load error: {e}")
+
 # --- GLOBAL THREAD-SAFE GUI HELPER PROCEDURES ---
 
 def hide_gui():
@@ -473,6 +715,12 @@ def trigger_capture(callback):
     global _app_instance
     if _app_instance:
         _app_instance.after(0, lambda: CustomAreaSelector(_app_instance, callback))
+
+def update_preview(src_path, proc_path=None):
+    """Thread-safe: schedule a preview update on the Tk main loop."""
+    global _app_instance
+    if _app_instance:
+        _app_instance.after(0, lambda: _app_instance.set_preview(src_path, proc_path))
 
 def show_gui(on_save_callback=None, on_recapture_callback=None, on_capture_callback=None):
     app = SettingsGUI(on_save_callback, on_recapture_callback, on_capture_callback)

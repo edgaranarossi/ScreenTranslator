@@ -55,6 +55,9 @@ def do_translation(custom_area):
             except Exception as e:
                 pass
         
+        # Show captured image in preview panel immediately
+        gui.update_preview(src_filepath, None)
+        
         # 2. Extract text and bboxes
         ocr_engine = cfg.get("ocr_engine", "EasyOCR")
         print(f"Extracting text (engine: {ocr_engine}, source language: {cfg.get('source_language', 'auto')})...")
@@ -113,6 +116,9 @@ def do_translation(custom_area):
         print("Creating overlay...")
         filepath = overlay.create_overlay(img, translated_data, font_name=cfg.get("font_name"))
         print(f"Done! Saved to {filepath}")
+        
+        # Update preview with both original + processed overlay
+        gui.update_preview(src_filepath, filepath)
         
     except Exception as e:
         print(f"An error occurred: {e}")
