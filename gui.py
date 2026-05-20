@@ -309,7 +309,7 @@ class SettingsGUI(tk.Tk):
         # OCR Engine
         tk.Label(card2, text="OCR Engine:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=3, column=0, sticky="w", pady=4)
         self.ocr_engine_var = tk.StringVar()
-        self.cmb_ocr = ttk.Combobox(card2, textvariable=self.ocr_engine_var, values=["EasyOCR", "PaddleOCR", "MangaOCR"], state="readonly", width=16)
+        self.cmb_ocr = ttk.Combobox(card2, textvariable=self.ocr_engine_var, values=["WindowsOCR", "EasyOCR", "PaddleOCR", "MangaOCR"], state="readonly", width=16)
         self.cmb_ocr.grid(row=3, column=1, sticky="e", pady=4)
         
         # Font Name

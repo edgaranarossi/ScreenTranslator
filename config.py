@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     "custom_area": [0, 0, 800, 600],  # x, y, width, height
     "source_language": "ja",
     "target_language": "en",
-    "ocr_engine": "EasyOCR",
+    "ocr_engine": "WindowsOCR",
     "font_name": "Wild Words",
     "filter_alphabet_only": True,
     "open_source_image": False,

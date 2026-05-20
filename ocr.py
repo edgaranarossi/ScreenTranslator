@@ -9,6 +9,12 @@ _paddle_ocr = None
 _paddle_lang = None
 _manga_ocr_model = None
 
+try:
+    import winocr
+    _winocr_available = True
+except ImportError:
+    _winocr_available = False
+
 # ─── EasyOCR ────────────────────────────────────────────────────────────
 
 def _get_easyocr_lang_list(source_language):
@@ -145,6 +151,100 @@ def _extract_manga(img, img_np, source_language):
         })
     return extracted_data
 
+# ─── Windows Media OCR ───────────────────────────────────────────────────
+
+def _extract_windows_ocr(img, img_np, source_language):
+    global _winocr_available
+    if not _winocr_available:
+        print("winocr package is not available. Falling back to EasyOCR.")
+        return _extract_easyocr(img, img_np, source_language)
+        
+    # Map source language to BCP-47 tags
+    lang_map = {
+        "ja": "ja",
+        "zh": "zh-Hans",
+        "ko": "ko",
+        "en": "en"
+    }
+    
+    lang_tag = lang_map.get(source_language.lower(), "en")
+    
+    is_supported = False
+    try:
+        is_supported = winocr.OcrEngine.is_language_supported(winocr.Language(lang_tag))
+    except Exception as e:
+        print(f"Error checking support for language '{lang_tag}': {e}")
+        
+    if not is_supported:
+        # Graceful fallbacks for 'auto'
+        if source_language.lower() == "auto":
+            for fallback_lang in ["ja", "en"]:
+                try:
+                    if winocr.OcrEngine.is_language_supported(winocr.Language(fallback_lang)):
+                        lang_tag = fallback_lang
+                        is_supported = True
+                        break
+                except Exception:
+                    pass
+        
+        if not is_supported:
+            print(f"Windows OCR does not support language '{lang_tag}' on this system. Falling back to EasyOCR.")
+            return _extract_easyocr(img, img_np, source_language)
+            
+    print(f"Using Windows OCR with language '{lang_tag}'...")
+    try:
+        result = winocr.recognize_pil_sync(img, lang=lang_tag)
+    except Exception as e:
+        print(f"Windows OCR recognition failed: {e}. Falling back to EasyOCR.")
+        return _extract_easyocr(img, img_np, source_language)
+        
+    extracted_data = []
+    lines = result.get("lines", [])
+    
+    for i, line in enumerate(lines):
+        text = line.get("text", "").strip()
+        if not text:
+            continue
+            
+        words = line.get("words", [])
+        if not words:
+            continue
+            
+        x_coords = []
+        y_coords = []
+        for w in words:
+            rect = w.get("bounding_rect")
+            if rect:
+                x = rect.get("x", 0)
+                y = rect.get("y", 0)
+                width = rect.get("width", 0)
+                height = rect.get("height", 0)
+                x_coords.extend([x, x + width])
+                y_coords.extend([y, y + height])
+                
+        if not x_coords or not y_coords:
+            continue
+            
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
+        bbox = [
+            [int(x_min), int(y_min)],
+            [int(x_max), int(y_min)],
+            [int(x_max), int(y_max)],
+            [int(x_min), int(y_max)]
+        ]
+        
+        bg_color = get_dominant_color(img, bbox)
+        
+        extracted_data.append({
+            "id": i,
+            "text": text,
+            "bbox": bbox,
+            "background_color": [int(c) for c in bg_color]
+        })
+        
+    return extracted_data
+
 # ─── Shared Utilities ────────────────────────────────────────────────────
 
 def get_dominant_color(image, bbox):
@@ -184,10 +284,12 @@ def get_dominant_color(image, bbox):
 
 # ─── Public API ──────────────────────────────────────────────────────────
 
-def initialize_ocr(engine="EasyOCR"):
+def initialize_ocr(engine="WindowsOCR"):
     """Pre-downloads models for the selected engine on startup."""
     print(f"Initializing OCR engine: {engine}...")
-    if engine == "EasyOCR":
+    if engine == "WindowsOCR":
+        print("Windows OCR initialized successfully (using native system APIs).")
+    elif engine == "EasyOCR":
         import easyocr
         lang_groups = [['en'], ['ja', 'en'], ['ch_sim', 'en'], ['ch_tra', 'en'], ['ko', 'en']]
         for langs in lang_groups:
@@ -211,7 +313,7 @@ def initialize_ocr(engine="EasyOCR"):
             print(f"Warning: Failed to initialize EasyOCR for bbox detection: {e}")
     print("OCR initialization complete.")
 
-def extract_text(image_path_or_pil, source_language="auto", engine="EasyOCR"):
+def extract_text(image_path_or_pil, source_language="auto", engine="WindowsOCR"):
     """
     Extracts text from an image using the selected OCR engine.
     Returns a list of dicts: {id, text, bbox, background_color}
@@ -226,5 +328,7 @@ def extract_text(image_path_or_pil, source_language="auto", engine="EasyOCR"):
         return _extract_paddle(img, img_np, source_language)
     elif engine == "MangaOCR":
         return _extract_manga(img, img_np, source_language)
+    elif engine == "WindowsOCR":
+        return _extract_windows_ocr(img, img_np, source_language)
     else:
         return _extract_easyocr(img, img_np, source_language)
