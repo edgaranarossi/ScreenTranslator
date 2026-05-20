@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Environment / Conda
+.env
+.venv
+venv/
+ENV/
+env/
+
+# ScreenTranslator Local Artifacts
+source/
+translated/
+config.json
+
+# IDEs
+.vscode/
+.idea/

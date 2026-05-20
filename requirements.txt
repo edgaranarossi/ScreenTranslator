@@ -1,0 +1,8 @@
+easyocr
+mss
+keyboard
+pillow
+requests
+paddlepaddle
+paddleocr
+manga-ocr
