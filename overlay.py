@@ -1,4 +1,5 @@
 import os
+import math
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import cv2
@@ -100,9 +101,27 @@ def inpaint_text_regions(image, box_infos):
         print(f"OpenCV Inpainting failed, falling back to original background: {e}")
         return image
 
+def hex_to_rgb(hex_str):
+    hex_str = hex_str.lstrip('#')
+    if len(hex_str) != 6:
+        return (255, 255, 255)
+    return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+
+def get_text_advance(text, font):
+    if hasattr(font, 'getlength'):
+        try:
+            return font.getlength(text)
+        except:
+            pass
+    if hasattr(font, 'getbbox'):
+        bbox = font.getbbox(text)
+        return bbox[2] - bbox[0]
+    return font.getsize(text)[0]
+
 def create_overlay(image, extracted_data, font_name=None):
     """
     Overlays translated text on the image using inpainting, size bucketing, and text strokes.
+    Supports advanced rotation rendering and variable per-word font colors.
     """
     img_copy = image.copy()
     
@@ -112,15 +131,28 @@ def create_overlay(image, extracted_data, font_name=None):
         bbox = item["bbox"]
         text = item.get("text", "")
         bg_color = tuple(item.get("background_color", (255, 255, 255)))
+        text_color = tuple(item.get("text_color", (0, 0, 0)))
+        angle = item.get("angle", 0.0)
+        color_spans = item.get("color_spans", [])
         
         x_min = min(p[0] for p in bbox)
         x_max = max(p[0] for p in bbox)
         y_min = min(p[1] for p in bbox)
         y_max = max(p[1] for p in bbox)
         
-        width = x_max - x_min
-        height = y_max - y_min
+        # Rotated size bounds
+        x1, y1 = bbox[0]
+        x2, y2 = bbox[1]
+        x3, y3 = bbox[2]
+        x4, y4 = bbox[3]
         
+        if abs(angle) >= 2.0:
+            width = int(math.sqrt((x2 - x1)**2 + (y2 - y1)**2))
+            height = int(math.sqrt((x4 - x1)**2 + (y4 - y1)**2))
+        else:
+            width = x_max - x_min
+            height = y_max - y_min
+            
         if width <= 0 or height <= 0:
             continue
         
@@ -141,9 +173,13 @@ def create_overlay(image, extracted_data, font_name=None):
             font_size -= 2
         
         box_infos.append({
+            "bbox": bbox,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "width": width, "height": height,
             "text": text, "bg_color": bg_color,
+            "text_color": text_color,
+            "angle": angle,
+            "color_spans": color_spans,
             "fitted_font_size": max(font_size, 8)
         })
     
@@ -190,14 +226,33 @@ def create_overlay(image, extracted_data, font_name=None):
         else:
             line_height = font.getsize("A")[1]
             
-        lines = wrap_text(info["text"], font, info["width"])
-        total_height = line_height * len(lines)
-        y_offset = info["y_min"] + max(0, (info["height"] - total_height) // 2)
+        width = info["width"]
+        height = info["height"]
+        bbox = info["bbox"]
+        angle = info["angle"]
+        text_color = info["text_color"]
+        color_spans = info["color_spans"]
+        translated_text = info["text"]
         
-        # Decide colors based on local background luminance
-        is_dark_bg = is_dark(info["bg_color"])
-        text_color = (255, 255, 255) if is_dark_bg else (0, 0, 0)
-        stroke_color = (0, 0, 0) if is_dark_bg else (255, 255, 255)
+        lines = wrap_text(translated_text, font, width)
+        total_height = line_height * len(lines)
+        
+        # Build character color map
+        char_colors = [text_color] * len(translated_text)
+        for span_obj in color_spans:
+            span_str = span_obj["span"]
+            hex_color = span_obj["color"]
+            rgb_color = hex_to_rgb(hex_color)
+            
+            start_idx = 0
+            while True:
+                idx = translated_text.lower().find(span_str.lower(), start_idx)
+                if idx == -1:
+                    break
+                for k in range(idx, idx + len(span_str)):
+                    if k < len(char_colors):
+                        char_colors[k] = rgb_color
+                start_idx = idx + 1
         
         # Dynamically scale stroke width relative to the active font size
         if font_size < 12:
@@ -207,24 +262,94 @@ def create_overlay(image, extracted_data, font_name=None):
         else:
             stroke_w = 3
             
-        for line in lines:
-            if hasattr(font, 'getbbox'):
-                line_width = font.getbbox(line)[2]
-            else:
-                line_width = font.getsize(line)[0]
-                
-            x_offset = info["x_min"] + max(0, (info["width"] - line_width) // 2)
+        def draw_lines_on_canvas(draw_obj, base_x, base_y):
+            y_offset = base_y
+            current_search_idx = 0
             
-            # Render text with contrasting strokes to guarantee legibility
-            draw.text(
-                (x_offset, y_offset),
-                line,
-                font=font,
-                fill=text_color,
-                stroke_width=stroke_w,
-                stroke_fill=stroke_color
-            )
-            y_offset += line_height
+            for line in lines:
+                line_idx = translated_text.find(line, current_search_idx)
+                if line_idx == -1:
+                    line_idx = 0
+                current_search_idx = line_idx + len(line)
+                
+                # Segment line into contiguous color chunks
+                segments = []
+                if line:
+                    start_char_idx = line_idx
+                    current_segment_text = [line[0]]
+                    current_color = char_colors[min(start_char_idx, len(char_colors)-1)]
+                    
+                    for char_in_line_idx, char in enumerate(line[1:], start=1):
+                        global_char_idx = start_char_idx + char_in_line_idx
+                        color = char_colors[min(global_char_idx, len(char_colors)-1)]
+                        if color == current_color:
+                            current_segment_text.append(char)
+                        else:
+                            segments.append({
+                                "text": "".join(current_segment_text),
+                                "color": current_color
+                            })
+                            current_color = color
+                            current_segment_text = [char]
+                            
+                    segments.append({
+                        "text": "".join(current_segment_text),
+                        "color": current_color
+                    })
+                
+                # Calculate total line width
+                if hasattr(font, 'getbbox'):
+                    line_width = font.getbbox(line)[2]
+                else:
+                    line_width = font.getsize(line)[0]
+                    
+                x_offset = base_x + max(0, (width - line_width) // 2)
+                
+                # Draw segments
+                x_cursor = x_offset
+                for seg in segments:
+                    seg_color = seg["color"]
+                    seg_stroke = (255, 255, 255) if is_dark(seg_color) else (0, 0, 0)
+                    draw_obj.text(
+                        (x_cursor, y_offset),
+                        seg["text"],
+                        font=font,
+                        fill=seg_color,
+                        stroke_width=stroke_w,
+                        stroke_fill=seg_stroke
+                    )
+                    x_cursor += get_text_advance(seg["text"], font)
+                    
+                y_offset += line_height
+
+        # Render rotated vs normal
+        if abs(angle) < 2.0:
+            y_start = info["y_min"] + max(0, (height - total_height) // 2)
+            draw_lines_on_canvas(draw, info["x_min"], y_start)
+        else:
+            # Render to transparent temporary canvas
+            txt_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            txt_draw = ImageDraw.Draw(txt_img)
+            
+            y_start = max(0, (height - total_height) // 2)
+            draw_lines_on_canvas(txt_draw, 0, y_start)
+            
+            # Rotate temporary image
+            rotated_txt_img = txt_img.rotate(-angle, resample=Image.Resampling.BICUBIC, expand=True)
+            
+            # Bounding box center
+            cx = sum(p[0] for p in bbox) / len(bbox)
+            cy = sum(p[1] for p in bbox) / len(bbox)
+            
+            # Rotated image center
+            rcx = rotated_txt_img.width / 2
+            rcy = rotated_txt_img.height / 2
+            
+            paste_x = int(cx - rcx)
+            paste_y = int(cy - rcy)
+            
+            # Paste with alpha mask
+            img_copy.paste(rotated_txt_img, (paste_x, paste_y), rotated_txt_img)
             
     # Save the file
     os.makedirs("translated", exist_ok=True)

@@ -1,28 +1,88 @@
 import json
 import requests
 
+def rgb_to_hex(rgb):
+    if not rgb or len(rgb) < 3:
+        return "#FFFFFF"
+    return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+def group_word_colors(word_colors):
+    """
+    Groups contiguous words of the same color together.
+    Returns a list of dicts: [{"color": "#RRGGBB", "words": "contiguous string"}]
+    """
+    if not word_colors:
+        return []
+    
+    grouped = []
+    current_color = word_colors[0]["color"]
+    current_words = [word_colors[0]["word"]]
+    
+    for wc in word_colors[1:]:
+        if wc["color"] == current_color:
+            current_words.append(wc["word"])
+        else:
+            joined_words = "".join(current_words) if any(ord(c) > 127 for c in "".join(current_words)) else " ".join(current_words)
+            grouped.append({
+                "color": current_color,
+                "words": joined_words.strip()
+            })
+            current_color = wc["color"]
+            current_words = [wc["word"]]
+            
+    joined_words = "".join(current_words) if any(ord(c) > 127 for c in "".join(current_words)) else " ".join(current_words)
+    grouped.append({
+        "color": current_color,
+        "words": joined_words.strip()
+    })
+    
+    return grouped
+
 def translate_batch(texts_dict, target_language, ollama_url, ollama_model):
     """
-    Translates a batch of texts using Ollama.
-    texts_dict: dict of {id_str: text_str}
-    Returns a dict of {id_str: translated_text_str}
+    Translates a batch of texts with structured color tagging using Ollama.
+    texts_dict: dict of {id_str: {"text": text_str, "colors": [...]}}
+    Returns a dict of {id_str: {"text": translated_text_str, "color_spans": [...]}}
     """
     if not texts_dict:
         return {}
 
     system_prompt = f"""You are a professional {target_language} native translator who needs to fluently translate text into {target_language}.
 
-## Translation Rules
-1. You will receive a JSON object where the keys are IDs and the values are the texts to translate.
-2. Output ONLY a valid JSON object where the keys are the exact same IDs, and the values are the translated texts into {target_language}.
+## Translation and Color Mapping Rules
+1. You will receive a JSON object where the keys are IDs, and each value is an object containing the "text" to translate, and a "colors" list of color groups in the original text (each group has a "color" hex and the original "words" that have this color).
+2. For each item, you must output a JSON object containing:
+   - "text": The fluent translation of the source text into {target_language}.
+   - "color_spans": A list mapping the exact original colors to the corresponding translated substring/span in your translation. Each item in "color_spans" must contain:
+     * "color": The original color hex.
+     * "span": The translated word or substring in your translation that corresponds to the original words. This "span" must be an exact substring of your translated "text".
+3. Output ONLY a valid JSON object where the keys are the exact same IDs, and the values are the objects described above.
+4. The translated text must preserve the meaning, cohesive context, and tone of the original texts (which are from the same screen capture).
+
+Example Input:
+{{
+  "0": {{
+    "text": "赤い太陽が青い空に昇る",
+    "colors": [
+      {{"color": "#FF3333", "words": "赤い太陽"}},
+      {{"color": "#FFFFFF", "words": "が"}},
+      {{"color": "#3366FF", "words": "青い空"}},
+      {{"color": "#FFFFFF", "words": "に昇る"}}
+    ]
+  }}
+}}
+
 Example Required Output Format:
 {{
-  "0": "Translated text 1",
-  "1": "Translated text 2"
+  "0": {{
+    "text": "The red sun rises in the blue sky",
+    "color_spans": [
+      {{"color": "#FF3333", "span": "The red sun"}},
+      {{"color": "#3366FF", "span": "the blue sky"}}
+    ]
+  }}
 }}
-Do not output any explanations, markdown code blocks, or additional content. Just the raw JSON.
-3. The returned translation must maintain exactly the same number of paragraphs and format as the original text.
-4. The provided texts are all regions extracted from the same screen capture. Use all the texts together as context to infer the correct meaning of ambiguous words, fix any obvious OCR typos, and produce cohesive and natural translations."""
+Do not output any explanations, markdown code blocks, or additional content. Just the raw JSON."""
 
     user_content = json.dumps(texts_dict, ensure_ascii=False)
 
@@ -33,7 +93,7 @@ Do not output any explanations, markdown code blocks, or additional content. Jus
             {"role": "user", "content": user_content}
         ],
         "stream": False,
-        "format": "json" # Ollama supports JSON format enforcement for compatible models
+        "format": "json"
     }
 
     try:
@@ -47,7 +107,6 @@ Do not output any explanations, markdown code blocks, or additional content. Jus
         except UnicodeEncodeError:
             print("DEBUG RAW CONTENT: <non-ascii content>")
             
-        # Sometimes models wrap JSON in markdown block even with format="json"
         content = content.strip()
         if content.startswith("```json"):
             content = content[7:]
@@ -64,45 +123,71 @@ Do not output any explanations, markdown code blocks, or additional content. Jus
             print(f"Raw model output: {content}")
         except:
             pass
-        # Fallback: return original texts if translation fails
-        return texts_dict
+        return {}
 
 def translate_texts(extracted_data, target_language, ollama_url, ollama_model, batch_size=10):
     """
-    Translates all extracted text in batches.
-    extracted_data: list of dicts with 'id' and 'text'.
-    Returns the same list but with 'text' updated to the translation.
+    Translates all extracted text in batches, preserving color spans.
+    extracted_data: list of dicts with 'id', 'text', 'word_colors', 'text_color'.
+    Returns the same list but with 'text' and 'color_spans' updated.
     """
     translated_data = []
     
-    # Process in batches
     for i in range(0, len(extracted_data), batch_size):
         batch = extracted_data[i:i + batch_size]
-        batch_to_translate = {str(item["id"]): item["text"] for item in batch}
+        
+        batch_to_translate = {}
+        for item in batch:
+            batch_to_translate[str(item["id"])] = {
+                "text": item["text"],
+                "colors": group_word_colors(item.get("word_colors", []))
+            }
         
         translated_batch = translate_batch(batch_to_translate, target_language, ollama_url, ollama_model)
         
-        # Map translated texts back to the original objects
         translation_map = {}
         if isinstance(translated_batch, dict):
             for key, val in translated_batch.items():
-                if isinstance(val, str):
+                if isinstance(val, dict):
                     translation_map[str(key)] = val
-                elif isinstance(val, dict) and "text" in val:
-                    # In case it wraps it like {"0": {"text": "foo"}}
-                    translation_map[str(key)] = val["text"]
+                elif isinstance(val, str):
+                    translation_map[str(key)] = {"text": val, "color_spans": []}
         
         for item in batch:
-            translated_text = translation_map.get(str(item["id"]), item["text"])
+            res_obj = translation_map.get(str(item["id"]), {"text": item["text"], "color_spans": []})
+            translated_text = res_obj.get("text", item["text"])
+            color_spans = res_obj.get("color_spans", [])
             
             orig_clean = "".join(item["text"].split()).lower()
             trans_clean = "".join(translated_text.split()).lower()
             
-            # If the translated text is identical to the original (e.g. it was already in target lang),
-            # skip it so we don't draw an overlay box for it.
             if orig_clean != trans_clean:
                 new_item = item.copy()
                 new_item["text"] = translated_text
+                
+                valid_spans = []
+                if isinstance(color_spans, list):
+                    for span_obj in color_spans:
+                        if isinstance(span_obj, dict) and "color" in span_obj and "span" in span_obj:
+                            color = span_obj["color"]
+                            span = span_obj["span"]
+                            if isinstance(span, str) and span.lower() in translated_text.lower():
+                                # Keep actual case from translated_text
+                                idx = translated_text.lower().find(span.lower())
+                                actual_span = translated_text[idx:idx + len(span)]
+                                valid_spans.append({
+                                    "color": color,
+                                    "span": actual_span
+                                })
+                                
+                if not valid_spans:
+                    t_color = item.get("text_color", [255, 255, 255])
+                    valid_spans = [{
+                        "color": rgb_to_hex(t_color),
+                        "span": translated_text
+                    }]
+                    
+                new_item["color_spans"] = valid_spans
                 translated_data.append(new_item)
             
     return translated_data

@@ -47,11 +47,20 @@ def _extract_easyocr(img, img_np, source_language):
         else:
             bbox, text, _ = res
         bg_color = get_dominant_color(img, bbox)
+        
+        bbox_list = [[int(pt[0]), int(pt[1])] for pt in bbox]
+        text_color = get_text_color(img, bbox_list, bg_color)
+        angle = get_bbox_angle(bbox_list)
+        word_colors = [{"word": text, "color": rgb_to_hex(text_color)}]
+        
         extracted_data.append({
             "id": i,
             "text": text,
-            "bbox": [[int(pt[0]), int(pt[1])] for pt in bbox],
-            "background_color": [int(c) for c in bg_color]
+            "bbox": bbox_list,
+            "background_color": [int(c) for c in bg_color],
+            "text_color": [int(c) for c in text_color],
+            "angle": angle,
+            "word_colors": word_colors
         })
     return extracted_data
 
@@ -92,11 +101,19 @@ def _extract_paddle(img, img_np, source_language):
         
         bbox = [[int(pt[0]), int(pt[1])] for pt in bbox_raw]
         bg_color = get_dominant_color(img, bbox)
+        
+        text_color = get_text_color(img, bbox, bg_color)
+        angle = get_bbox_angle(bbox)
+        word_colors = [{"word": text, "color": rgb_to_hex(text_color)}]
+        
         extracted_data.append({
             "id": idx,
             "text": text,
             "bbox": bbox,
-            "background_color": [int(c) for c in bg_color]
+            "background_color": [int(c) for c in bg_color],
+            "text_color": [int(c) for c in text_color],
+            "angle": angle,
+            "word_colors": word_colors
         })
         idx += 1
     return extracted_data
@@ -143,11 +160,20 @@ def _extract_manga(img, img_np, source_language):
         text = mocr(cropped)
         
         bg_color = get_dominant_color(img, bbox)
+        
+        bbox_list = [[int(pt[0]), int(pt[1])] for pt in bbox]
+        text_color = get_text_color(img, bbox_list, bg_color)
+        angle = get_bbox_angle(bbox_list)
+        word_colors = [{"word": text, "color": rgb_to_hex(text_color)}]
+        
         extracted_data.append({
             "id": i,
             "text": text,
-            "bbox": [[int(pt[0]), int(pt[1])] for pt in bbox],
-            "background_color": [int(c) for c in bg_color]
+            "bbox": bbox_list,
+            "background_color": [int(c) for c in bg_color],
+            "text_color": [int(c) for c in text_color],
+            "angle": angle,
+            "word_colors": word_colors
         })
     return extracted_data
 
@@ -245,12 +271,41 @@ def _extract_windows_ocr(img, img_np, source_language):
         ]
         
         bg_color = get_dominant_color(img, bbox)
+        text_color = get_text_color(img, bbox, bg_color)
+        angle = get_bbox_angle(bbox)
         
+        word_colors = []
+        for w in words:
+            rect = w.get("bounding_rect")
+            if rect:
+                wx = max(0, min(int(rect.get("x", 0)), img.width))
+                wy = max(0, min(int(rect.get("y", 0)), img.height))
+                ww = max(0, min(int(rect.get("width", 0)), img.width - wx))
+                wh = max(0, min(int(rect.get("height", 0)), img.height - wy))
+                if ww > 0 and wh > 0:
+                    w_bbox = [
+                        [wx, wy],
+                        [wx + ww, wy],
+                        [wx + ww, wy + wh],
+                        [wx, wy + wh]
+                    ]
+                    w_color = get_text_color(img, w_bbox, bg_color)
+                    word_colors.append({
+                        "word": w.get("text", ""),
+                        "color": rgb_to_hex(w_color)
+                    })
+                    
+        if not word_colors:
+            word_colors = [{"word": text, "color": rgb_to_hex(text_color)}]
+            
         extracted_data.append({
             "id": i,
             "text": text,
             "bbox": bbox,
-            "background_color": [int(c) for c in bg_color]
+            "background_color": [int(c) for c in bg_color],
+            "text_color": [int(c) for c in text_color],
+            "angle": angle,
+            "word_colors": word_colors
         })
         
     return extracted_data
@@ -290,6 +345,65 @@ def get_dominant_color(image, bbox):
     border_pixels = np.concatenate(border_pixels, axis=0)
     median_color = np.median(border_pixels, axis=0).astype(int)
     
+    return tuple(median_color)
+
+def is_dark(color):
+    r, g, b = color
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return luminance < 0.5
+
+def get_bbox_angle(bbox):
+    """
+    Computes the rotation angle in degrees from a 4-corner polygon:
+    [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] (usually top-left, top-right, bottom-right, bottom-left)
+    """
+    if not bbox or len(bbox) < 4:
+        return 0.0
+        
+    import math
+    dx = bbox[1][0] - bbox[0][0]  # top-right minus top-left
+    dy = bbox[1][1] - bbox[0][1]
+    angle_rad = math.atan2(dy, dx)
+    angle_deg = math.degrees(angle_rad)
+    
+    # Avoid small angle jitter
+    if abs(angle_deg) < 2.0:
+        return 0.0
+    return angle_deg
+
+def rgb_to_hex(rgb):
+    return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+def get_text_color(image, bbox, bg_color):
+    """
+    Extracts the dominant text (foreground) color from a bounding box region.
+    """
+    pts = np.array(bbox, dtype=np.int32)
+    x_min = max(0, np.min(pts[:, 0]))
+    x_max = min(image.width, np.max(pts[:, 0]))
+    y_min = max(0, np.min(pts[:, 1]))
+    y_max = min(image.height, np.max(pts[:, 1]))
+    
+    if x_max <= x_min or y_max <= y_min:
+        return (255, 255, 255) if is_dark(bg_color) else (0, 0, 0)
+        
+    crop = image.crop((x_min, y_min, x_max, y_max))
+    pixels = np.array(crop.convert("RGB")).reshape(-1, 3)
+    
+    # Calculate Euclidean distance from bg_color
+    bg = np.array(bg_color)
+    distances = np.linalg.norm(pixels - bg, axis=1)
+    
+    # Select foreground pixels
+    fg_pixels = pixels[distances > 45]
+    
+    if len(fg_pixels) < 5:
+        fg_pixels = pixels[distances > 20]
+        
+    if len(fg_pixels) < 5:
+        return (255, 255, 255) if is_dark(bg_color) else (0, 0, 0)
+        
+    median_color = np.median(fg_pixels, axis=0).astype(int)
     return tuple(median_color)
 
 # ─── Public API ──────────────────────────────────────────────────────────
