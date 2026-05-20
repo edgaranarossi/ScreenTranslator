@@ -231,11 +231,5 @@ def create_overlay(image, extracted_data, font_name=None):
     filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.png")
     filepath = os.path.join("translated", filename)
     img_copy.save(filepath)
-    
-    # Open the image with default viewer
-    try:
-        os.startfile(filepath)
-    except Exception as e:
-        print(f"Error opening image: {e}")
         
     return filepath

@@ -151,7 +151,6 @@ class SettingsGUI(tk.Tk):
         _app_instance = self
         
         self.title("ScreenTranslator Settings")
-        self.geometry("920x620")
         self.configure(bg=BG_MAIN)
         self.resizable(True, True)
         self.minsize(700, 500)
@@ -162,6 +161,13 @@ class SettingsGUI(tk.Tk):
         
         self.cfg = config.load_config()
         
+        # Restore saved window geometry or use default
+        saved_geom = self.cfg.get("window_geometry", "920x620")
+        self.geometry(saved_geom)
+        
+        # Save geometry on close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        
         # Preview state
         self._orig_pil = None       # Original captured PIL image
         self._proc_pil = None       # Processed overlay PIL image
@@ -171,11 +177,22 @@ class SettingsGUI(tk.Tk):
         self._proc_tk = None
         self._split_x = 0.5         # Split position as ratio 0..1
         self._dragging = False
+        self._last_proc_path = None # Last processed overlay file path
+        self._last_src_path = None  # Last source capture file path
         
         self._apply_modern_theme()
         self._create_widgets()
         self._load_values()
         self._draw_placeholder()
+    
+    def _on_close(self):
+        """Save window geometry to config before exiting."""
+        try:
+            self.cfg["window_geometry"] = self.geometry()
+            config.save_config(self.cfg)
+        except Exception:
+            pass
+        self.destroy()
         
     def _apply_modern_theme(self):
         """Configure standard TTK styles to match modern Dark Mode palette."""
@@ -478,12 +495,24 @@ class SettingsGUI(tk.Tk):
     
     def _build_preview_panel(self, parent):
         """Build the right-side preview canvas with wipe comparison."""
-        # Header label
+        # Header bar
         hdr = tk.Frame(parent, bg=BG_CARD)
         hdr.pack(fill="x", padx=12, pady=(12, 0))
         tk.Label(hdr, text="Preview", bg=BG_CARD, fg=TEXT_MAIN, font=(FONT_FAMILY, 10, "bold")).pack(side="left")
         self._status_lbl = tk.Label(hdr, text="No capture yet", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 8))
-        self._status_lbl.pack(side="right")
+        self._status_lbl.pack(side="right", padx=(6, 0))
+        
+        # Open in Viewer button
+        self._btn_open = tk.Button(
+            hdr, text="↗ Open", bg="#27272a", fg=TEXT_MUTED,
+            activebackground="#3f3f46", activeforeground=TEXT_MAIN,
+            bd=0, relief="flat", padx=6, pady=1,
+            font=(FONT_FAMILY, 8), cursor="hand2",
+            command=self._open_in_viewer, state="disabled"
+        )
+        self._btn_open.pack(side="right")
+        self._btn_open.bind("<Enter>", lambda e: self._btn_open.configure(bg="#3f3f46"))
+        self._btn_open.bind("<Leave>", lambda e: self._btn_open.configure(bg="#27272a"))
         
         # Canvas
         self._canvas = tk.Canvas(parent, bg="#111113", highlightthickness=0, cursor="sb_h_double_arrow")
@@ -495,6 +524,16 @@ class SettingsGUI(tk.Tk):
         self._canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self._canvas.bind("<Configure>", self._on_canvas_resize)
+    
+    def _open_in_viewer(self):
+        """Open the latest processed image in the OS default viewer."""
+        import os
+        path = self._last_proc_path or self._last_src_path
+        if path and os.path.exists(path):
+            try:
+                os.startfile(path)
+            except Exception as e:
+                print(f"Error opening image: {e}")
     
     def _draw_placeholder(self):
         """Draw an elegant placeholder when no capture exists."""
@@ -673,8 +712,11 @@ class SettingsGUI(tk.Tk):
         """Load preview images. Called from the main thread via after()."""
         try:
             if src_path:
+                self._last_src_path = src_path
                 self._orig_pil = Image.open(src_path).convert("RGB")
+                self._btn_open.configure(state="normal")
             if proc_path:
+                self._last_proc_path = proc_path
                 self._proc_pil = Image.open(proc_path).convert("RGB")
                 self._split_x = 0.5
                 self._status_lbl.configure(text="Drag to compare")
