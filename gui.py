@@ -11,6 +11,10 @@ _app_instance = None
 
 class CustomAreaSelector(tk.Toplevel):
     def __init__(self, parent, callback):
+        # Hide settings GUI immediately to make the screen underneath visible
+        if parent:
+            parent.withdraw()
+            
         super().__init__(parent)
         self.callback = callback
         
@@ -29,7 +33,7 @@ class CustomAreaSelector(tk.Toplevel):
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Escape>", self.on_escape)
         
         with mss.mss() as sct:
             self.monitor = sct.monitors[0]
@@ -55,6 +59,11 @@ class CustomAreaSelector(tk.Toplevel):
         cur_y = self.canvas.canvasy(event.y)
         self.canvas.coords(self.rect, self.start_x, self.start_y, cur_x, cur_y)
 
+    def on_escape(self, event):
+        self.destroy()
+        if self.master:
+            self.master.deiconify()
+
     def on_release(self, event):
         end_x = self.canvas.canvasx(event.x)
         end_y = self.canvas.canvasy(event.y)
@@ -67,6 +76,9 @@ class CustomAreaSelector(tk.Toplevel):
         self.destroy()
         if w > 10 and h > 10:
             self.callback([x, y, w, h])
+        else:
+            if self.master:
+                self.master.deiconify()
 
 # Custom modern styling color constants
 BG_MAIN = "#09090b"        # Deep rich zinc background
@@ -132,7 +144,7 @@ def get_local_ollama_models(ollama_chat_url):
 
 
 class SettingsGUI(tk.Tk):
-    def __init__(self, on_save_callback=None, on_recapture_callback=None):
+    def __init__(self, on_save_callback=None, on_recapture_callback=None, on_capture_callback=None):
         super().__init__()
         global _app_instance
         _app_instance = self
@@ -145,6 +157,7 @@ class SettingsGUI(tk.Tk):
         
         self.on_save_callback = on_save_callback
         self.on_recapture_callback = on_recapture_callback
+        self.on_capture_callback = on_capture_callback
         
         self.cfg = config.load_config()
         
@@ -218,32 +231,62 @@ class SettingsGUI(tk.Tk):
         card1 = tk.Frame(main_frame, bg=BG_CARD, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER_COLOR)
         card1.pack(fill="x", pady=6)
         
-        tk.Label(card1, text="Capture & Hotkeys", bg=BG_CARD, fg=TEXT_MAIN, font=(FONT_FAMILY, 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        tk.Label(card1, text="Capture & Hotkeys", bg=BG_CARD, fg=TEXT_MAIN, font=(FONT_FAMILY, 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         
         # Main Hotkey
         tk.Label(card1, text="Main Hotkey:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=1, column=0, sticky="w", pady=4)
         self.hotkey_var = tk.StringVar()
-        self.entry_hotkey = ttk.Entry(card1, textvariable=self.hotkey_var, width=18)
-        self.entry_hotkey.grid(row=1, column=1, sticky="e", pady=4)
+        self.entry_hotkey = ttk.Entry(card1, textvariable=self.hotkey_var, width=12)
+        self.entry_hotkey.grid(row=1, column=1, sticky="ew", pady=4, padx=(0, 6))
+        
+        self.btn_capture_now = tk.Button(card1, 
+                                         text="Capture", 
+                                         bg=ACCENT_COLOR, 
+                                         fg="white", 
+                                         activebackground=ACCENT_HOVER, 
+                                         activeforeground="white", 
+                                         bd=0, 
+                                         relief="flat", 
+                                         padx=8, 
+                                         pady=2, 
+                                         font=(FONT_FAMILY, 8, "bold"), 
+                                         cursor="hand2", 
+                                         command=self._capture_now)
+        self.btn_capture_now.grid(row=1, column=2, sticky="e", pady=4)
         
         # Recapture Hotkey
         tk.Label(card1, text="Recapture Hotkey:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=2, column=0, sticky="w", pady=4)
         self.recapture_hotkey_var = tk.StringVar()
-        self.entry_rehotkey = ttk.Entry(card1, textvariable=self.recapture_hotkey_var, width=18)
-        self.entry_rehotkey.grid(row=2, column=1, sticky="e", pady=4)
+        self.entry_rehotkey = ttk.Entry(card1, textvariable=self.recapture_hotkey_var, width=12)
+        self.entry_rehotkey.grid(row=2, column=1, sticky="ew", pady=4, padx=(0, 6))
+        
+        self.btn_recap_now = tk.Button(card1, 
+                                       text="Recapture", 
+                                       bg="#27272a", 
+                                       fg=TEXT_MAIN, 
+                                       activebackground="#3f3f46", 
+                                       activeforeground=TEXT_MAIN, 
+                                       bd=0, 
+                                       relief="flat", 
+                                       padx=8, 
+                                       pady=2, 
+                                       font=(FONT_FAMILY, 8, "bold"), 
+                                       cursor="hand2", 
+                                       command=self._recapture)
+        self.btn_recap_now.grid(row=2, column=2, sticky="e", pady=4)
         
         # Checkboxes
         self.filter_var = tk.BooleanVar()
         self.chk_filter = tk.Checkbutton(card1, text="Filter out Alphabet-only text", variable=self.filter_var, 
                                          bg=BG_CARD, fg=TEXT_MAIN, activebackground=BG_CARD, activeforeground=TEXT_MAIN, 
                                          selectcolor=BG_INPUT, bd=0, highlightthickness=0, font=(FONT_FAMILY, 9), cursor="hand2")
-        self.chk_filter.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        self.chk_filter.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 2))
         
         self.open_src_var = tk.BooleanVar()
         self.chk_open = tk.Checkbutton(card1, text="Open captured image before translation", variable=self.open_src_var, 
                                        bg=BG_CARD, fg=TEXT_MAIN, activebackground=BG_CARD, activeforeground=TEXT_MAIN, 
                                        selectcolor=BG_INPUT, bd=0, highlightthickness=0, font=(FONT_FAMILY, 9), cursor="hand2")
-        self.chk_open.grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
+        self.chk_open.grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
         
         # --- CARD 2: OCR & LANGUAGE SETTINGS ---
         card2 = tk.Frame(main_frame, bg=BG_CARD, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER_COLOR)
@@ -356,6 +399,8 @@ class SettingsGUI(tk.Tk):
             
         bind_hover(self.btn_recap, "#27272a", "#3f3f46")
         bind_hover(self.btn_save, ACCENT_COLOR, ACCENT_HOVER)
+        bind_hover(self.btn_capture_now, ACCENT_COLOR, ACCENT_HOVER)
+        bind_hover(self.btn_recap_now, "#27272a", "#3f3f46")
 
     def _load_values(self):
         self.hotkey_var.set(self.cfg.get("hotkey", "ctrl+alt+t"))
@@ -370,6 +415,10 @@ class SettingsGUI(tk.Tk):
         self.filter_var.set(self.cfg.get("filter_alphabet_only", True))
         self.open_src_var.set(self.cfg.get("open_source_image", False))
         
+    def _capture_now(self):
+        if self.on_capture_callback:
+            self.on_capture_callback()
+
     def _recapture(self):
         if self.on_recapture_callback:
             self.on_recapture_callback()
@@ -425,6 +474,6 @@ def trigger_capture(callback):
     if _app_instance:
         _app_instance.after(0, lambda: CustomAreaSelector(_app_instance, callback))
 
-def show_gui(on_save_callback=None, on_recapture_callback=None):
-    app = SettingsGUI(on_save_callback, on_recapture_callback)
+def show_gui(on_save_callback=None, on_recapture_callback=None, on_capture_callback=None):
+    app = SettingsGUI(on_save_callback, on_recapture_callback, on_capture_callback)
     app.mainloop()

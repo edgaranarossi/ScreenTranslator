@@ -184,7 +184,7 @@ def main():
     
     print("Showing GUI... Close the GUI to exit the application.")
     # Show settings GUI with callbacks
-    gui.show_gui(on_save_callback=on_config_saved, on_recapture_callback=on_recapture)
+    gui.show_gui(on_save_callback=on_config_saved, on_recapture_callback=on_recapture, on_capture_callback=on_hotkey)
     
     # When GUI is closed, unhook and exit
     keyboard.unhook_all()
