@@ -71,13 +71,15 @@ def main():
     print("\nCreating test image...")
     img = create_test_image()
     
-    print("\nExtracting text from image (Source: Japanese)...")
-    extracted_data = ocr.extract_text(img, "ja")
+    print("\nExtracting text from image with multi-OCR consensus (Source: Japanese)...")
+    extracted_data = ocr.extract_text_multi(img, "ja")
     
     print(f"Extracted {len(extracted_data)} regions:")
     for d in extracted_data:
         try:
-            print(f" - [{d['id']}] {d['text']}")
+            proposals = d.get("proposals", [])
+            p_str = ", ".join(f"{p['engine']}:{p['text']}" for p in proposals)
+            print(f" - [{d['id']}] {d['text']}  (proposals: {p_str})")
         except UnicodeEncodeError:
             print(f" - [{d['id']}] <non-ascii text>")
         

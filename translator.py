@@ -72,24 +72,30 @@ def translate_batch(texts_dict, target_language, ollama_url, ollama_model):
 
 ## Translation, Merging and Color Mapping Rules
 1. You will receive a JSON object where the keys are IDs, and each value is an object containing:
-   - "text": The text to translate.
+   - "text": The primary OCR reading of the text.
+   - "proposals": A list of alternative OCR readings from different engines (each has "engine" name and "text"). If there is only one proposal, the reading is confident. If there are multiple proposals with different text, analyze all of them and determine the most likely correct original text using context, grammar, and common sense before translating.
    - "colors": A list of color groups in the original text (each has "color" hex and "words").
    - "far_from_previous": A boolean. If true, it means this text block is physically far away from the preceding text block on the screen.
 2. **Semantic Block Merging**: You must analyze if adjacent text blocks are semantically connected (e.g. part of the same sentence, speech bubble, or paragraph).
    - If they are connected, you should merge them into a single coherent translated sentence.
    - **Physical Distance Constraints**: You **MUST NEVER** merge text blocks across a physical distance gap. If a block has `"far_from_previous": true`, it CANNOT be merged with the previous block.
-3. For each group of merged or individual text blocks, you must output an object in the "results" list containing:
+3. **CRITICAL: Every input ID must appear in exactly one "source_ids" list in your output.** Do not skip or omit any IDs. If you are unsure about a block, output it individually with its own source_ids list.
+4. For each group of merged or individual text blocks, you must output an object in the "results" list containing:
    - "source_ids": A list of integer IDs of the original text blocks that were merged to form this translation (e.g. `[0, 1]` if merged, or just `[0]` if not merged).
    - "text": The fluent translation of the merged/individual text into {target_language}.
    - "color_spans": A list mapping the exact original colors to the corresponding translated substring/span in your translation. Each item in "color_spans" must contain:
      * "color": The original color hex.
      * "span": The translated word or substring in your translation that corresponds to the original words. This "span" must be an exact substring of your translated "text".
-4. Output ONLY a valid JSON object with a single root key "results" containing a list of these objects. Do not output any explanations, markdown code blocks, or additional content. Just the raw JSON.
+5. Output ONLY a valid JSON object with a single root key "results" containing a list of these objects. Do not output any explanations, markdown code blocks, or additional content. Just the raw JSON.
 
 Example Input:
 {{
   "0": {{
     "text": "赤い太陽が",
+    "proposals": [
+      {{"engine": "WindowsOCR", "text": "赤い太陽が"}},
+      {{"engine": "EasyOCR", "text": "赤い太陽か"}}
+    ],
     "colors": [
       {{"color": "#FF3333", "words": "赤い太陽"}}
     ],
@@ -97,6 +103,9 @@ Example Input:
   }},
   "1": {{
     "text": "青い空に昇る",
+    "proposals": [
+      {{"engine": "WindowsOCR", "text": "青い空に昇る"}}
+    ],
     "colors": [
       {{"color": "#3366FF", "words": "青い空"}}
     ],
@@ -104,6 +113,9 @@ Example Input:
   }},
   "2": {{
     "text": "別の看板",
+    "proposals": [
+      {{"engine": "WindowsOCR", "text": "別の看板"}}
+    ],
     "colors": [
       {{"color": "#FFFFFF", "words": "別の看板"}}
     ],
@@ -183,6 +195,7 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
     
     for i in range(0, len(extracted_data), batch_size):
         batch = extracted_data[i:i + batch_size]
+        batch_id_set = {item["id"] for item in batch}
         
         batch_to_translate = {}
         for j, item in enumerate(batch):
@@ -196,11 +209,13 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
                 if gap > threshold:
                     far = True
             
-            batch_to_translate[str(item["id"])] = {
+            entry = {
                 "text": item["text"],
+                "proposals": item.get("proposals", [{"engine": "primary", "text": item["text"]}]),
                 "colors": group_word_colors(item.get("word_colors", [])),
                 "far_from_previous": far
             }
+            batch_to_translate[str(item["id"])] = entry
         
         translated_batch = translate_batch(batch_to_translate, target_language, ollama_url, ollama_model)
         
@@ -218,11 +233,17 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
                     continue
                 source_ids = group.get("source_ids", [])
                 
-                # Resilient integer list parsing
+                # Resilient integer list parsing with ID normalization
                 parsed_ids = []
                 for s_id in source_ids:
                     try:
-                        parsed_ids.append(int(s_id))
+                        int_id = int(s_id)
+                        # Try direct match first (global ID)
+                        if int_id in batch_id_set:
+                            parsed_ids.append(int_id)
+                        # Try as batch-local 0-based index
+                        elif 0 <= int_id < len(batch) and batch[int_id]["id"] not in translated_ids:
+                            parsed_ids.append(batch[int_id]["id"])
                     except (ValueError, TypeError):
                         pass
                         
@@ -282,64 +303,113 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
                 for it in matching_items:
                     translated_ids.add(it["id"])
                     
-        # ── Resilient Fallback Loop for Skipped IDs ──
-        for item in batch:
-            if item["id"] not in translated_ids:
-                print(f"Warning: Item {item['id']} was not processed by LLM. Running individual fallback...")
-                
-                fallback_dict = {
-                    str(item["id"]): {
-                        "text": item["text"],
-                        "colors": group_word_colors(item.get("word_colors", [])),
-                        "far_from_previous": False
-                    }
+        # ── Batched Fallback for Skipped IDs ──
+        missed_items = [item for item in batch if item["id"] not in translated_ids]
+        
+        if missed_items:
+            print(f"Warning: {len(missed_items)} item(s) not processed by LLM (IDs: {[it['id'] for it in missed_items]}). Running batched fallback...")
+            
+            fallback_dict = {}
+            for item in missed_items:
+                fallback_dict[str(item["id"])] = {
+                    "text": item["text"],
+                    "proposals": item.get("proposals", [{"engine": "primary", "text": item["text"]}]),
+                    "colors": group_word_colors(item.get("word_colors", [])),
+                    "far_from_previous": False
                 }
-                
-                fallback_res = translate_batch(fallback_dict, target_language, ollama_url, ollama_model)
-                
-                fallback_text = item["text"]
-                fallback_spans = []
-                
-                res_list = []
-                if isinstance(fallback_res, dict) and "results" in fallback_res:
-                    res_list = fallback_res["results"]
-                elif isinstance(fallback_res, list):
-                    res_list = fallback_res
+            
+            fallback_res = translate_batch(fallback_dict, target_language, ollama_url, ollama_model)
+            
+            fallback_results = []
+            if isinstance(fallback_res, dict) and "results" in fallback_res:
+                fallback_results = fallback_res["results"]
+            elif isinstance(fallback_res, list):
+                fallback_results = fallback_res
+            
+            fallback_translated_ids = set()
+            
+            if isinstance(fallback_results, list):
+                for group in fallback_results:
+                    if not isinstance(group, dict):
+                        continue
+                    source_ids = group.get("source_ids", [])
+                    parsed_ids = []
+                    for s_id in source_ids:
+                        try:
+                            int_id = int(s_id)
+                            if int_id in {it["id"] for it in missed_items}:
+                                parsed_ids.append(int_id)
+                        except (ValueError, TypeError):
+                            pass
                     
-                if isinstance(res_list, list) and len(res_list) > 0 and isinstance(res_list[0], dict):
-                    fallback_text = res_list[0].get("text", item["text"])
-                    fallback_spans = res_list[0].get("color_spans", [])
+                    fb_matching = [it for it in missed_items if it["id"] in parsed_ids and it["id"] not in fallback_translated_ids]
+                    if not fb_matching:
+                        continue
                     
-                valid_spans = []
-                if isinstance(fallback_spans, list):
-                    for span_obj in fallback_spans:
-                        if isinstance(span_obj, dict) and "color" in span_obj and "span" in span_obj:
-                            color = span_obj["color"]
-                            span = span_obj["span"]
-                            if isinstance(span, str) and span.lower() in fallback_text.lower():
-                                idx = fallback_text.lower().find(span.lower())
-                                actual_span = fallback_text[idx:idx + len(span)]
-                                valid_spans.append({
-                                    "color": color,
-                                    "span": actual_span
-                                })
-                                
-                if not valid_spans:
-                    valid_spans = [{
-                        "color": rgb_to_hex(item.get("text_color", [0, 0, 0])),
-                        "span": fallback_text
-                    }]
+                    fb_text = group.get("text", "").strip()
+                    fb_color_spans = group.get("color_spans", [])
+                    first_fb = fb_matching[0]
                     
-                translated_data.append({
-                    "id": item["id"],
-                    "text": fallback_text,
-                    "bbox": item["bbox"],
-                    "original_bboxes": [item["bbox"]],
-                    "background_color": item.get("background_color", [255, 255, 255]),
-                    "text_color": item.get("text_color", [0, 0, 0]),
-                    "angle": item.get("angle", 0.0),
-                    "color_spans": valid_spans
-                })
-                translated_ids.add(item["id"])
+                    valid_spans = []
+                    if isinstance(fb_color_spans, list):
+                        for span_obj in fb_color_spans:
+                            if isinstance(span_obj, dict) and "color" in span_obj and "span" in span_obj:
+                                span = span_obj["span"]
+                                if isinstance(span, str) and span.lower() in fb_text.lower():
+                                    idx = fb_text.lower().find(span.lower())
+                                    actual_span = fb_text[idx:idx + len(span)]
+                                    valid_spans.append({
+                                        "color": span_obj["color"],
+                                        "span": actual_span
+                                    })
+                    
+                    if not valid_spans:
+                        valid_spans = [{
+                            "color": rgb_to_hex(first_fb.get("text_color", [0, 0, 0])),
+                            "span": fb_text
+                        }]
+                    
+                    fb_bboxes = [it["bbox"] for it in fb_matching]
+                    if len(fb_bboxes) > 1:
+                        fb_x_min = min(pt[0] for bbox in fb_bboxes for pt in bbox)
+                        fb_x_max = max(pt[0] for bbox in fb_bboxes for pt in bbox)
+                        fb_y_min = min(pt[1] for bbox in fb_bboxes for pt in bbox)
+                        fb_y_max = max(pt[1] for bbox in fb_bboxes for pt in bbox)
+                        fb_merged = [[fb_x_min, fb_y_min], [fb_x_max, fb_y_min], [fb_x_max, fb_y_max], [fb_x_min, fb_y_max]]
+                    else:
+                        fb_merged = first_fb["bbox"]
+                    
+                    translated_data.append({
+                        "id": first_fb["id"],
+                        "text": fb_text,
+                        "bbox": fb_merged,
+                        "original_bboxes": fb_bboxes,
+                        "background_color": first_fb.get("background_color", [255, 255, 255]),
+                        "text_color": first_fb.get("text_color", [0, 0, 0]),
+                        "angle": first_fb.get("angle", 0.0),
+                        "color_spans": valid_spans
+                    })
+                    
+                    for it in fb_matching:
+                        fallback_translated_ids.add(it["id"])
+            
+            # Last resort: any items still not translated get raw text passthrough
+            for item in missed_items:
+                if item["id"] not in fallback_translated_ids:
+                    print(f"Warning: Item {item['id']} could not be translated even in fallback. Using raw text.")
+                    translated_data.append({
+                        "id": item["id"],
+                        "text": item["text"],
+                        "bbox": item["bbox"],
+                        "original_bboxes": [item["bbox"]],
+                        "background_color": item.get("background_color", [255, 255, 255]),
+                        "text_color": item.get("text_color", [0, 0, 0]),
+                        "angle": item.get("angle", 0.0),
+                        "color_spans": [{
+                            "color": rgb_to_hex(item.get("text_color", [0, 0, 0])),
+                            "span": item["text"]
+                        }]
+                    })
                 
     return translated_data
+

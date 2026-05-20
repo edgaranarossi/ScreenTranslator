@@ -456,3 +456,101 @@ def extract_text(image_path_or_pil, source_language="auto", engine="WindowsOCR")
         return _extract_windows_ocr(img, img_np, source_language)
     else:
         return _extract_easyocr(img, img_np, source_language)
+
+# ─── Multi-OCR Consensus ─────────────────────────────────────────────────
+
+def _recognize_crop_winocr(crop_pil, source_language):
+    """Run Windows OCR on a small cropped PIL image, return recognized text."""
+    global _winocr_available
+    if not _winocr_available:
+        return None
+    
+    lang_map = {"ja": "ja", "zh": "zh-Hans", "ko": "ko", "en": "en"}
+    lang_tag = lang_map.get(source_language.lower(), "en")
+    
+    try:
+        result = winocr.recognize_pil_sync(crop_pil, lang=lang_tag)
+        lines = result.get("lines", [])
+        text = " ".join(line.get("text", "") for line in lines).strip()
+        return text if text else None
+    except Exception:
+        return None
+
+def _recognize_crop_easyocr(crop_pil, source_language):
+    """Run EasyOCR on a small cropped PIL image, return recognized text."""
+    try:
+        reader = _init_easyocr(source_language)
+        crop_np = np.array(crop_pil.convert("RGB"))
+        results = reader.readtext(crop_np, paragraph=True)
+        
+        texts = []
+        for res in results:
+            if len(res) == 2:
+                _, text = res
+            else:
+                _, text, _ = res
+            texts.append(text)
+        
+        combined = " ".join(texts).strip()
+        return combined if combined else None
+    except Exception:
+        return None
+
+def _get_secondary_engine(primary_engine):
+    """Determine which secondary OCR engine to use for multi-OCR consensus."""
+    if primary_engine == "WindowsOCR":
+        return "EasyOCR"
+    elif primary_engine in ("EasyOCR", "PaddleOCR", "MangaOCR"):
+        return "WindowsOCR"
+    return "EasyOCR"
+
+def extract_text_multi(image_path_or_pil, source_language="auto", engine="WindowsOCR"):
+    """
+    Multi-OCR consensus extraction.
+    1. Runs the primary engine for bounding box detection + text.
+    2. For each detected bbox, crops the image and runs a secondary engine 
+       to get an alternative text proposal.
+    3. Returns the same format as extract_text(), but each item gains a
+       "proposals" list: [{"engine": "...", "text": "..."}, ...].
+    """
+    if isinstance(image_path_or_pil, str):
+        img = Image.open(image_path_or_pil)
+    else:
+        img = image_path_or_pil
+    
+    # Step 1: Run primary engine
+    extracted_data = extract_text(img, source_language, engine)
+    
+    if not extracted_data:
+        return extracted_data
+    
+    # Step 2: Determine secondary engine
+    secondary = _get_secondary_engine(engine)
+    
+    # Step 3: For each bbox, crop and run secondary recognition
+    pad = 5  # Small padding around the crop for context
+    for item in extracted_data:
+        bbox = item["bbox"]
+        x_min = max(0, min(p[0] for p in bbox) - pad)
+        y_min = max(0, min(p[1] for p in bbox) - pad)
+        x_max = min(img.width, max(p[0] for p in bbox) + pad)
+        y_max = min(img.height, max(p[1] for p in bbox) + pad)
+        
+        crop = img.crop((x_min, y_min, x_max, y_max))
+        
+        proposals = [{"engine": engine, "text": item["text"]}]
+        
+        # Run secondary OCR on the crop
+        secondary_text = None
+        if secondary == "WindowsOCR":
+            secondary_text = _recognize_crop_winocr(crop, source_language)
+        elif secondary == "EasyOCR":
+            secondary_text = _recognize_crop_easyocr(crop, source_language)
+        
+        if secondary_text and secondary_text != item["text"]:
+            proposals.append({"engine": secondary, "text": secondary_text})
+        
+        item["proposals"] = proposals
+    
+    return extracted_data
+

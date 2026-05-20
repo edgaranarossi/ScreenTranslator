@@ -356,12 +356,19 @@ class SettingsGUI(tk.Tk):
         self.cmb_ocr = ttk.Combobox(card2, textvariable=self.ocr_engine_var, values=["WindowsOCR", "EasyOCR", "PaddleOCR", "MangaOCR"], state="readonly", width=16)
         self.cmb_ocr.grid(row=3, column=1, sticky="e", pady=4)
         
+        # Multi-OCR Consensus checkbox
+        self.multi_ocr_var = tk.BooleanVar()
+        self.chk_multi_ocr = tk.Checkbutton(card2, text="Multi-OCR Consensus (use secondary engine for proposals)", variable=self.multi_ocr_var, 
+                                             bg=BG_CARD, fg=TEXT_MAIN, activebackground=BG_CARD, activeforeground=TEXT_MAIN, 
+                                             selectcolor=BG_INPUT, bd=0, highlightthickness=0, font=(FONT_FAMILY, 9), cursor="hand2")
+        self.chk_multi_ocr.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        
         # Font Name
-        tk.Label(card2, text="Overlay Font Family:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=4, column=0, sticky="w", pady=4)
+        tk.Label(card2, text="Overlay Font Family:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=5, column=0, sticky="w", pady=4)
         self.font_var = tk.StringVar()
         font_choices = ["Wild Words", "Anime Ace", "CC Wild Words Roman", "Comic Sans MS", "Arial", "Segoe UI", "MS Gothic", "Meiryo"]
         self.cmb_font = ttk.Combobox(card2, textvariable=self.font_var, values=font_choices, width=16)
-        self.cmb_font.grid(row=4, column=1, sticky="e", pady=4)
+        self.cmb_font.grid(row=5, column=1, sticky="e", pady=4)
         
         # --- CARD 3: OLLAMA LLM SETTINGS ---
         card3 = tk.Frame(main_frame, bg=BG_CARD, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER_COLOR)
@@ -457,6 +464,7 @@ class SettingsGUI(tk.Tk):
         self.ocr_engine_var.set(self.cfg.get("ocr_engine", "EasyOCR"))
         self.font_var.set(self.cfg.get("font_name", "Wild Words"))
         self.filter_var.set(self.cfg.get("filter_alphabet_only", True))
+        self.multi_ocr_var.set(self.cfg.get("multi_ocr", True))
         self.open_src_var.set(self.cfg.get("open_source_image", False))
         
     def _capture_now(self):
@@ -477,6 +485,7 @@ class SettingsGUI(tk.Tk):
         self.cfg["ocr_engine"] = self.ocr_engine_var.get()
         self.cfg["font_name"] = self.font_var.get()
         self.cfg["filter_alphabet_only"] = self.filter_var.get()
+        self.cfg["multi_ocr"] = self.multi_ocr_var.get()
         self.cfg["open_source_image"] = self.open_src_var.get()
         try:
             self.cfg["batch_size"] = int(self.batch_var.get())

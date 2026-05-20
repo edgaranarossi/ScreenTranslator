@@ -60,8 +60,12 @@ def do_translation(custom_area):
         
         # 2. Extract text and bboxes
         ocr_engine = cfg.get("ocr_engine", "EasyOCR")
-        print(f"Extracting text (engine: {ocr_engine}, source language: {cfg.get('source_language', 'auto')})...")
-        extracted_data = ocr.extract_text(img, cfg.get("source_language", "auto"), engine=ocr_engine)
+        use_multi_ocr = cfg.get("multi_ocr", True)
+        print(f"Extracting text (engine: {ocr_engine}, multi-OCR: {use_multi_ocr}, source language: {cfg.get('source_language', 'auto')})...")
+        if use_multi_ocr:
+            extracted_data = ocr.extract_text_multi(img, cfg.get("source_language", "auto"), engine=ocr_engine)
+        else:
+            extracted_data = ocr.extract_text(img, cfg.get("source_language", "auto"), engine=ocr_engine)
         print(f"Found {len(extracted_data)} text regions:")
         for d in extracted_data:
             try:

@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "ocr_engine": "WindowsOCR",
     "font_name": "Wild Words",
     "filter_alphabet_only": True,
+    "multi_ocr": True,
     "open_source_image": False,
     "ollama_url": "http://localhost:11434/api/chat",
     "ollama_model": "aya-expanse:8b",
