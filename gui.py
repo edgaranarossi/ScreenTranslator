@@ -4,6 +4,8 @@ import config
 import capture
 import mss
 import ctypes
+import requests
+from urllib.parse import urlparse
 
 _app_instance = None
 
@@ -76,6 +78,58 @@ TEXT_MUTED = "#a1a1aa"     # Description and label gray
 ACCENT_COLOR = "#6366f1"   # Vibrant indigo highlight
 ACCENT_HOVER = "#4f46e5"   # Hover state indigo
 FONT_FAMILY = "Segoe UI"   # Sleek modern system font
+
+def get_local_ollama_models(ollama_chat_url):
+    """
+    Queries the local Ollama tags API and falls back to running the 'ollama list' CLI
+    to fetch the list of installed models.
+    """
+    default_models = ["deepseek-r1:14b", "aya-expanse:8b", "llama3.2", "phi3"]
+    discovered_models = set()
+    
+    # 1. Try to query the local REST API
+    try:
+        parsed = urlparse(ollama_chat_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        tags_url = f"{base_url}/api/tags"
+        
+        print(f"Fetching local Ollama models from: {tags_url}")
+        # Small timeout to prevent hanging the GUI startup if Ollama is offline
+        response = requests.get(tags_url, timeout=1.5)
+        if response.status_code == 200:
+            data = response.json()
+            models = data.get("models", [])
+            for m in models:
+                name = m.get("name")
+                if name:
+                    discovered_models.add(name)
+            if discovered_models:
+                print(f"Discovered {len(discovered_models)} models via Ollama API.")
+    except Exception as e:
+        print(f"Could not connect to Ollama REST API: {e}")
+        
+    # 2. If REST API didn't return anything or failed, try the CLI command "ollama list"
+    if not discovered_models:
+        try:
+            print("Checking local models via 'ollama list' command...")
+            import subprocess
+            result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=2.0)
+            if result.returncode == 0:
+                lines = result.stdout.strip().split("\n")
+                if len(lines) > 1: # first line is header
+                    for line in lines[1:]:
+                        parts = line.split()
+                        if parts:
+                            discovered_models.add(parts[0])
+                    print(f"Discovered {len(discovered_models)} models via 'ollama list' CLI.")
+        except Exception as e:
+            print(f"Could not execute 'ollama list' command: {e}")
+
+    if not discovered_models:
+        return default_models
+        
+    return sorted(list(discovered_models))
+
 
 class SettingsGUI(tk.Tk):
     def __init__(self, on_save_callback=None, on_recapture_callback=None):
@@ -234,11 +288,19 @@ class SettingsGUI(tk.Tk):
         self.entry_url = ttk.Entry(card3, textvariable=self.url_var, width=22)
         self.entry_url.grid(row=1, column=1, sticky="e", pady=4)
         
-        # Ollama Model
+        # Ollama Model (Editable Combobox populated from local Ollama tags list)
         tk.Label(card3, text="Ollama Model:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=2, column=0, sticky="w", pady=4)
         self.model_var = tk.StringVar()
-        self.entry_model = ttk.Entry(card3, textvariable=self.model_var, width=22)
-        self.entry_model.grid(row=2, column=1, sticky="e", pady=4)
+        
+        # Load local models dynamically
+        url = self.cfg.get("ollama_url", "http://localhost:11434/api/chat")
+        local_models = get_local_ollama_models(url)
+        current_model = self.cfg.get("ollama_model", "aya-expanse:8b")
+        if current_model not in local_models:
+            local_models.insert(0, current_model)
+            
+        self.cmb_model = ttk.Combobox(card3, textvariable=self.model_var, values=local_models, width=20)
+        self.cmb_model.grid(row=2, column=1, sticky="e", pady=4)
         
         # Batch Size
         tk.Label(card3, text="Batch Size:", bg=BG_CARD, fg=TEXT_MUTED, font=(FONT_FAMILY, 9)).grid(row=3, column=0, sticky="w", pady=4)
