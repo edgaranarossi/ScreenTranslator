@@ -1,8 +1,19 @@
-easyocr
+# Core runtime
 mss
 keyboard
 pillow
 requests
+numpy
+opencv-python
+fonttools
+winocr            # Windows native OCR (default engine; no torch needed)
+
+# OCR engines that pull in torch / heavy ML deps.
+# torch is required by easyocr/manga-ocr AND must import before winocr (see ocr.py).
+torch
+easyocr
+
+# Optional extra OCR engines (large installs):
 paddlepaddle
 paddleocr
 manga-ocr

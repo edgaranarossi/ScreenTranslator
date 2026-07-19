@@ -7,6 +7,7 @@ import mss
 import ctypes
 import requests
 from urllib.parse import urlparse
+from datetime import datetime
 
 _app_instance = None
 
@@ -92,6 +93,21 @@ ACCENT_COLOR = "#6366f1"   # Vibrant indigo highlight
 ACCENT_HOVER = "#4f46e5"   # Hover state indigo
 FONT_FAMILY = "Segoe UI"   # Sleek modern system font
 
+def normalize_ollama_url(ollama_url):
+    """Ensure the saved Ollama URL targets the chat endpoint (/api/chat).
+
+    The translator POSTs a chat-style payload, so a bare base URL like
+    'http://localhost:11434' returns 405 ('wrong url' error). Normalize whatever
+    the user typed so the stored config is always correct.
+    """
+    if not ollama_url:
+        return ollama_url
+    url = ollama_url.strip().rstrip("/")
+    if "/api/" not in url:
+        url = url + "/api/chat"
+    return url
+
+
 def get_local_ollama_models(ollama_chat_url):
     """
     Queries the local Ollama tags API and falls back to running the 'ollama list' CLI
@@ -158,7 +174,13 @@ class SettingsGUI(tk.Tk):
         self.on_save_callback = on_save_callback
         self.on_recapture_callback = on_recapture_callback
         self.on_capture_callback = on_capture_callback
-        
+
+        # Suppress auto-save while we populate the widgets. _load_values sets the
+        # StringVars one-by-one; each set fires the auto-save trace, which would
+        # otherwise read the still-empty vars and overwrite self.cfg (and the
+        # config file) with blanks mid-load — wiping every field after the first.
+        self._loading = True
+
         self.cfg = config.load_config()
         
         # Restore saved window geometry or use default
@@ -179,10 +201,16 @@ class SettingsGUI(tk.Tk):
         self._dragging = False
         self._last_proc_path = None # Last processed overlay file path
         self._last_src_path = None  # Last source capture file path
-        
+
+        # Console log buffer
+        self._console_log = []
+        self._max_console_lines = 50
+
         self._apply_modern_theme()
         self._create_widgets()
         self._load_values()
+        # Loading complete: re-enable auto-save for genuine user edits.
+        self._loading = False
         self._draw_placeholder()
     
     def _on_close(self):
@@ -282,6 +310,10 @@ class SettingsGUI(tk.Tk):
         self.hotkey_var = tk.StringVar()
         self.entry_hotkey = ttk.Entry(card1, textvariable=self.hotkey_var, width=12)
         self.entry_hotkey.grid(row=1, column=1, sticky="ew", pady=4, padx=(0, 6))
+        # Re-register hotkeys only when the field is committed (focus-out / Enter),
+        # not on every keystroke (which would re-hook mid-typed combos like "ctrl+").
+        self.entry_hotkey.bind('<FocusOut>', lambda e: self._apply_hotkeys())
+        self.entry_hotkey.bind('<Return>', lambda e: self._apply_hotkeys())
         
         self.btn_capture_now = tk.Button(card1, 
                                          text="Capture", 
@@ -303,6 +335,8 @@ class SettingsGUI(tk.Tk):
         self.recapture_hotkey_var = tk.StringVar()
         self.entry_rehotkey = ttk.Entry(card1, textvariable=self.recapture_hotkey_var, width=12)
         self.entry_rehotkey.grid(row=2, column=1, sticky="ew", pady=4, padx=(0, 6))
+        self.entry_rehotkey.bind('<FocusOut>', lambda e: self._apply_hotkeys())
+        self.entry_rehotkey.bind('<Return>', lambda e: self._apply_hotkeys())
         
         self.btn_recap_now = tk.Button(card1, 
                                        text="Recapture", 
@@ -406,52 +440,96 @@ class SettingsGUI(tk.Tk):
         card1.columnconfigure(1, weight=1)
         card2.columnconfigure(1, weight=1)
         card3.columnconfigure(1, weight=1)
-        
+
+        # Console log panel (above buttons)
+        console_frame = tk.Frame(main_frame, bg=BG_MAIN)
+        console_frame.pack(fill="x", pady=(12, 0))
+
+        self._console_output = tk.Text(
+            console_frame,
+            height=5,
+            bg="#0a0a0c",
+            fg="#a1a1aa",
+            font=("Consolas", 8),
+            relief="flat",
+            borderwidth=0
+        )
+        self._console_output.pack(fill="both", expand=False, pady=(4, 0))
+        self._console_output.tag_config("info", foreground="#a1a1aa")
+        self._console_output.tag_config("success", foreground="#4ade80")
+        self._console_output.tag_config("error", foreground="#f87171")
+        self._console_output.tag_config("warning", foreground="#facc15")
+        self._console_output.tag_config("accent", foreground=ACCENT_COLOR)
+
+        # Scrollbar for console
+        console_scroll = tk.Scrollbar(self._console_output, command=self._console_output.yview)
+        self._console_output.configure(yscrollcommand=console_scroll.set)
+        console_scroll.pack(side="right", fill="y")
+
+        # Progress bar (above buttons)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100, mode="determinate")
+        self.progress_bar.pack(fill="x", side="bottom", pady=(12, 8))
+
         # --- BOTTOM ACTION BUTTONS ---
         btn_frame = tk.Frame(main_frame, bg=BG_MAIN)
-        btn_frame.pack(fill="x", side="bottom", pady=(15, 0))
-        
-        # Recapture button (Sleek dark secondary button)
-        self.btn_recap = tk.Button(btn_frame, 
-                                   text="Recapture Previous", 
-                                   bg="#27272a", 
-                                   fg=TEXT_MAIN, 
-                                   activebackground="#3f3f46", 
-                                   activeforeground=TEXT_MAIN, 
-                                   bd=0, 
-                                   relief="flat", 
-                                   padx=12, 
-                                   pady=8, 
-                                   font=(FONT_FAMILY, 9, "bold"), 
-                                   cursor="hand2", 
+        btn_frame.pack(fill="x", side="bottom")
+
+        # Capture button
+        self.btn_capture = tk.Button(btn_frame,
+                                     text="Capture",
+                                     bg=ACCENT_COLOR,
+                                     fg="white",
+                                     activebackground=ACCENT_HOVER,
+                                     activeforeground="white",
+                                     bd=0,
+                                     relief="flat",
+                                     padx=12,
+                                     pady=8,
+                                     font=(FONT_FAMILY, 9, "bold"),
+                                     cursor="hand2",
+                                     command=self._capture_now)
+        self.btn_capture.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        # Recapture button
+        self.btn_recap = tk.Button(btn_frame,
+                                   text="Recapture",
+                                   bg="#27272a",
+                                   fg=TEXT_MAIN,
+                                   activebackground="#3f3f46",
+                                   activeforeground=TEXT_MAIN,
+                                   bd=0,
+                                   relief="flat",
+                                   padx=12,
+                                   pady=8,
+                                   font=(FONT_FAMILY, 9, "bold"),
+                                   cursor="hand2",
                                    command=self._recapture)
-        self.btn_recap.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        
-        # Save Settings button (Vibrant Indigo accent primary button)
-        self.btn_save = tk.Button(btn_frame, 
-                                  text="Save Settings", 
-                                  bg=ACCENT_COLOR, 
-                                  fg="white", 
-                                  activebackground=ACCENT_HOVER, 
-                                  activeforeground="white", 
-                                  bd=0, 
-                                  relief="flat", 
-                                  padx=12, 
-                                  pady=8, 
-                                  font=(FONT_FAMILY, 9, "bold"), 
-                                  cursor="hand2", 
-                                  command=self._save)
-        self.btn_save.pack(side="right", fill="x", expand=True, padx=(6, 0))
-        
+        self.btn_recap.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
         # Bind hover micro-animations
         def bind_hover(btn, normal_bg, hover_bg):
             btn.bind("<Enter>", lambda e: btn.configure(bg=hover_bg))
             btn.bind("<Leave>", lambda e: btn.configure(bg=normal_bg))
-            
+
+        bind_hover(self.btn_capture, ACCENT_COLOR, ACCENT_HOVER)
         bind_hover(self.btn_recap, "#27272a", "#3f3f46")
-        bind_hover(self.btn_save, ACCENT_COLOR, ACCENT_HOVER)
-        bind_hover(self.btn_capture_now, ACCENT_COLOR, ACCENT_HOVER)
-        bind_hover(self.btn_recap_now, "#27272a", "#3f3f46")
+
+        # Setup auto-save on entry changes
+        self.hotkey_var.trace_add('write', lambda *args: self._auto_save())
+        self.recapture_hotkey_var.trace_add('write', lambda *args: self._auto_save())
+        self.src_lang_var.trace_add('write', lambda *args: self._auto_save())
+        self.tgt_lang_var.trace_add('write', lambda *args: self._auto_save())
+        self.url_var.trace_add('write', lambda *args: self._auto_save())
+        self.model_var.trace_add('write', lambda *args: self._auto_save())
+        self.ocr_engine_var.trace_add('write', lambda *args: self._auto_save())
+        self.font_var.trace_add('write', lambda *args: self._auto_save())
+        self.filter_var.trace_add('write', lambda *args: self._auto_save())
+        self.multi_ocr_var.trace_add('write', lambda *args: self._auto_save())
+        self.open_src_var.trace_add('write', lambda *args: self._auto_save())
+        self.batch_var.trace_add('write', lambda *args: self._auto_save())
+
+        self.entry_batch.bind('<FocusOut>', lambda e: self._auto_save())
 
     def _load_values(self):
         self.hotkey_var.set(self.cfg.get("hotkey", "ctrl+alt+t"))
@@ -467,6 +545,44 @@ class SettingsGUI(tk.Tk):
         self.multi_ocr_var.set(self.cfg.get("multi_ocr", True))
         self.open_src_var.set(self.cfg.get("open_source_image", False))
         
+    def _apply_hotkeys(self):
+        """Commit settings and re-register the global hotkeys (focus-out / Enter
+        on the hotkey fields). Lets edited hotkeys take effect without a restart."""
+        if getattr(self, "_loading", False):
+            return
+        self._auto_save()
+        if self.on_save_callback:
+            try:
+                self.on_save_callback(self.cfg)
+            except Exception as e:
+                self.log(f"Failed to apply hotkeys: {e}", "error")
+
+    def _auto_save(self):
+        """Auto-save settings on any change."""
+        # Ignore trace callbacks fired while _load_values is populating widgets.
+        if getattr(self, "_loading", False):
+            return
+        try:
+            self.cfg["hotkey"] = self.hotkey_var.get()
+            self.cfg["recapture_hotkey"] = self.recapture_hotkey_var.get()
+            self.cfg["source_language"] = self.src_lang_var.get()
+            self.cfg["target_language"] = self.tgt_lang_var.get()
+            self.cfg["ollama_url"] = normalize_ollama_url(self.url_var.get())
+            self.cfg["ollama_model"] = self.model_var.get()
+            self.cfg["ocr_engine"] = self.ocr_engine_var.get()
+            self.cfg["font_name"] = self.font_var.get()
+            self.cfg["filter_alphabet_only"] = self.filter_var.get()
+            self.cfg["multi_ocr"] = self.multi_ocr_var.get()
+            self.cfg["open_source_image"] = self.open_src_var.get()
+            try:
+                self.cfg["batch_size"] = int(self.batch_var.get())
+            except ValueError:
+                self.cfg["batch_size"] = 10
+            if not config.save_config(self.cfg):
+                self.log("Failed to save settings to config.json", "error")
+        except Exception as e:
+            self.log(f"Error saving settings: {e}", "error")
+
     def _capture_now(self):
         if self.on_capture_callback:
             self.on_capture_callback()
@@ -475,30 +591,22 @@ class SettingsGUI(tk.Tk):
         if self.on_recapture_callback:
             self.on_recapture_callback()
 
-    def _save(self):
-        self.cfg["hotkey"] = self.hotkey_var.get()
-        self.cfg["recapture_hotkey"] = self.recapture_hotkey_var.get()
-        self.cfg["source_language"] = self.src_lang_var.get()
-        self.cfg["target_language"] = self.tgt_lang_var.get()
-        self.cfg["ollama_url"] = self.url_var.get()
-        self.cfg["ollama_model"] = self.model_var.get()
-        self.cfg["ocr_engine"] = self.ocr_engine_var.get()
-        self.cfg["font_name"] = self.font_var.get()
-        self.cfg["filter_alphabet_only"] = self.filter_var.get()
-        self.cfg["multi_ocr"] = self.multi_ocr_var.get()
-        self.cfg["open_source_image"] = self.open_src_var.get()
-        try:
-            self.cfg["batch_size"] = int(self.batch_var.get())
-        except ValueError:
-            self.cfg["batch_size"] = 10
-            
-        config.save_config(self.cfg)
-        
-        # Display custom styled dialog info box
-        messagebox.showinfo("Saved", "Settings saved successfully!")
-        
-        if self.on_save_callback:
-            self.on_save_callback(self.cfg)
+    def log(self, message, level="info"):
+        """Log a message to the console panel."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}\n"
+        if hasattr(self, '_console_output') and self._console_output:
+            self._console_output.insert(tk.END, line, level)
+            self._console_output.see(tk.END)
+            lines = int(self._console_output.index('end-1c').split('.')[0])
+            if lines > self._max_console_lines:
+                self._console_output.delete('1.0', f'{lines - self._max_console_lines}.0')
+
+    def set_progress(self, value, message=None):
+        """Update progress bar value (0-100)."""
+        self.progress_var.set(value)
+        if message:
+            self.log(message, "accent")
 
     # ─── Preview Panel ─────────────────────────────────────────────────
     

@@ -2,14 +2,16 @@ import threading
 import keyboard
 import time
 import sys
+import os
 import ctypes
+from datetime import datetime
 
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2) # Per monitor aware
-except:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per monitor aware
+except (AttributeError, OSError):
     try:
         ctypes.windll.user32.SetProcessDPIAware()
-    except:
+    except (AttributeError, OSError):
         pass
 
 import config
@@ -19,22 +21,24 @@ import translator
 import overlay
 import gui
 
-# Global state to prevent multiple simultaneous captures
-is_translating = False
+# Seconds to wait for the settings window to finish hiding before capture.
+# The hide is scheduled asynchronously on the Tk main loop, so we give it a beat.
+GUI_HIDE_DELAY = 0.4
+
+# A non-blocking lock gates the pipeline: two near-simultaneous triggers (e.g.
+# mashing the recapture hotkey) can't kick off concurrent captures.
+_translation_lock = threading.Lock()
 
 def do_translation(custom_area):
-    global is_translating
-    if is_translating:
-        return
-    is_translating = True
+    if not _translation_lock.acquire(blocking=False):
+        return  # a translation is already in progress
     print("\nStarting translation process...")
     try:
         cfg = config.load_config()
-        
+
         # 1. Capture screen
         gui.hide_gui()
-        import time
-        time.sleep(0.4) # Wait for the GUI to fully hide
+        time.sleep(GUI_HIDE_DELAY)  # wait for the GUI to finish hiding
         print(f"Capturing custom area: {custom_area}")
         try:
             img = capture.capture_screen("Custom Area", custom_area)
@@ -42,17 +46,16 @@ def do_translation(custom_area):
             gui.restore_gui()
         
         # Save source image for verification
-        import os
-        from datetime import datetime
-        os.makedirs("source", exist_ok=True)
+        source_dir = os.path.join(config.BASE_DIR, "source")
+        os.makedirs(source_dir, exist_ok=True)
         src_filename = datetime.now().strftime("source_%Y-%m-%d_%H-%M-%S.png")
-        src_filepath = os.path.join("source", src_filename)
+        src_filepath = os.path.join(source_dir, src_filename)
         img.save(src_filepath)
         print(f"Saved source capture to {src_filepath}")
         if cfg.get("open_source_image", False):
             try:
                 os.startfile(src_filepath)
-            except Exception as e:
+            except OSError:
                 pass
         
         # Show captured image in preview panel immediately
@@ -75,7 +78,6 @@ def do_translation(custom_area):
         
         if not extracted_data:
             print("No text found.")
-            is_translating = False
             return
             
         if cfg.get("filter_alphabet_only", True):
@@ -94,7 +96,6 @@ def do_translation(custom_area):
             
         if not extracted_data:
             print("No non-alphabet text found after filtering.")
-            is_translating = False
             return
             
         # 3. Translate
@@ -113,7 +114,6 @@ def do_translation(custom_area):
             
         if not translated_data:
             print("No text required translation (or OCR/Translation failed).")
-            is_translating = False
             return
         
         # 4. Create overlay and open
@@ -126,8 +126,12 @@ def do_translation(custom_area):
         
     except Exception as e:
         print(f"An error occurred: {e}")
+        try:
+            gui.show_warning("Translation failed", f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
     finally:
-        is_translating = False
+        _translation_lock.release()
 
 def on_area_selected(area):
     if area:

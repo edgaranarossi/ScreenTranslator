@@ -1,5 +1,8 @@
 import json
+import logging
 import requests
+
+log = logging.getLogger("screentranslator.translator")
 
 def rgb_to_hex(rgb):
     if not rgb or len(rgb) < 3:
@@ -59,6 +62,22 @@ def calculate_gap(bbox1, bbox2):
     import math
     return math.sqrt(x_dist**2 + y_dist**2)
 
+def _normalize_ollama_url(ollama_url):
+    """Ensure the URL targets Ollama's chat endpoint.
+
+    The request payload uses the chat-style ``messages`` format, so it must be
+    POSTed to ``/api/chat``. Users often configure just the base URL
+    (e.g. ``http://localhost:11434``), which returns 405 and silently falls back
+    to rendering the untranslated source text. Normalize such URLs here.
+    """
+    if not ollama_url:
+        return ollama_url
+    url = ollama_url.strip().rstrip("/")
+    if "/api/" not in url:
+        url = url + "/api/chat"
+    return url
+
+
 def translate_batch(texts_dict, target_language, ollama_url, ollama_model):
     """
     Translates a batch of texts with semantic block merging and color mapping using Ollama.
@@ -67,6 +86,8 @@ def translate_batch(texts_dict, target_language, ollama_url, ollama_model):
     """
     if not texts_dict:
         return {}
+
+    ollama_url = _normalize_ollama_url(ollama_url)
 
     system_prompt = f"""You are a professional {target_language} native translator who needs to fluently translate text into {target_language}.
 
@@ -156,17 +177,15 @@ Example Required Output Format:
         "format": "json"
     }
 
+    content = None
     try:
         response = requests.post(ollama_url, json=payload, timeout=60)
         response.raise_for_status()
         result = response.json()
         content = result.get("message", {}).get("content", "{}")
-        
-        try:
-            print(f"DEBUG RAW CONTENT: {content}")
-        except UnicodeEncodeError:
-            print("DEBUG RAW CONTENT: <non-ascii content>")
-            
+
+        log.debug("Raw model output: %s", content)
+
         content = content.strip()
         if content.startswith("```json"):
             content = content[7:]
@@ -174,15 +193,13 @@ Example Required Output Format:
             content = content[3:]
         if content.endswith("```"):
             content = content[:-3]
-            
+
         translated_data = json.loads(content.strip())
         return translated_data
     except Exception as e:
         print(f"Translation error: {e}")
-        try:
-            print(f"Raw model output: {content}")
-        except:
-            pass
+        if content is not None:
+            log.debug("Unparseable model output: %s", content)
         return {}
 
 def translate_texts(extracted_data, target_language, ollama_url, ollama_model, batch_size=10):
@@ -233,19 +250,18 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
                     continue
                 source_ids = group.get("source_ids", [])
                 
-                # Resilient integer list parsing with ID normalization
+                # Accept ONLY ids that match a real block id in this batch.
+                # (A previous "batch-local index" fallback reinterpreted a stray
+                # small integer as a list position, which silently attached a
+                # translation to the wrong text block — corrupting output.)
                 parsed_ids = []
                 for s_id in source_ids:
                     try:
                         int_id = int(s_id)
-                        # Try direct match first (global ID)
-                        if int_id in batch_id_set:
-                            parsed_ids.append(int_id)
-                        # Try as batch-local 0-based index
-                        elif 0 <= int_id < len(batch) and batch[int_id]["id"] not in translated_ids:
-                            parsed_ids.append(batch[int_id]["id"])
                     except (ValueError, TypeError):
-                        pass
+                        continue
+                    if int_id in batch_id_set:
+                        parsed_ids.append(int_id)
                         
                 matching_items = [it for it in batch if it["id"] in parsed_ids and it["id"] not in translated_ids]
                 if not matching_items:
@@ -275,7 +291,7 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
                         if isinstance(span_obj, dict) and "color" in span_obj and "span" in span_obj:
                             color = span_obj["color"]
                             span = span_obj["span"]
-                            if isinstance(span, str) and span.lower() in translated_text.lower():
+                            if isinstance(span, str) and span.strip() and span.lower() in translated_text.lower():
                                 idx = translated_text.lower().find(span.lower())
                                 actual_span = translated_text[idx:idx + len(span)]
                                 valid_spans.append({
@@ -355,7 +371,7 @@ def translate_texts(extracted_data, target_language, ollama_url, ollama_model, b
                         for span_obj in fb_color_spans:
                             if isinstance(span_obj, dict) and "color" in span_obj and "span" in span_obj:
                                 span = span_obj["span"]
-                                if isinstance(span, str) and span.lower() in fb_text.lower():
+                                if isinstance(span, str) and span.strip() and span.lower() in fb_text.lower():
                                     idx = fb_text.lower().find(span.lower())
                                     actual_span = fb_text[idx:idx + len(span)]
                                     valid_spans.append({

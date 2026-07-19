@@ -9,6 +9,28 @@ _paddle_ocr = None
 _paddle_lang = None
 _manga_ocr_model = None
 
+# IMPORTANT: torch must be imported BEFORE winocr.
+# winocr's WinRT runtime loads C++/OpenMP runtime DLLs that break torch's
+# c10.dll initialization (WinError 1114) if torch is imported afterwards.
+# EasyOCR/MangaOCR import torch lazily, which is too late once winocr has
+# already loaded — so we pre-load torch here, before winocr, to fix the
+# conflict for every engine and for multi-OCR combinations.
+try:
+    import torch  # noqa: F401
+except Exception:
+    torch = None
+
+def _easyocr_use_gpu():
+    """True only if a CUDA device is actually available.
+
+    EasyOCR's Reader(gpu=True) raises on CPU-only machines (or a broken CUDA
+    torch), so detect support instead of hardcoding True.
+    """
+    try:
+        return bool(torch is not None and torch.cuda.is_available())
+    except Exception:
+        return False
+
 try:
     import winocr
     _winocr_available = True
@@ -32,7 +54,7 @@ def _init_easyocr(source_language):
     langs = _get_easyocr_lang_list(source_language)
     if _easyocr_reader is None or _easyocr_langs != langs:
         print(f"Loading EasyOCR model for {langs}...")
-        _easyocr_reader = easyocr.Reader(langs, gpu=True)
+        _easyocr_reader = easyocr.Reader(langs, gpu=_easyocr_use_gpu())
         _easyocr_langs = langs
     return _easyocr_reader
 
@@ -419,7 +441,7 @@ def initialize_ocr(engine="WindowsOCR"):
         for langs in lang_groups:
             try:
                 print(f"Checking/Downloading models for {langs}...")
-                temp_reader = easyocr.Reader(langs, gpu=True)
+                temp_reader = easyocr.Reader(langs, gpu=_easyocr_use_gpu())
                 del temp_reader
             except Exception as e:
                 print(f"Warning: Failed to initialize {langs}: {e}")
@@ -431,7 +453,7 @@ def initialize_ocr(engine="WindowsOCR"):
         import easyocr
         print("Checking/Downloading EasyOCR models for bbox detection...")
         try:
-            temp_reader = easyocr.Reader(['ja', 'en'], gpu=True)
+            temp_reader = easyocr.Reader(['ja', 'en'], gpu=_easyocr_use_gpu())
             del temp_reader
         except Exception as e:
             print(f"Warning: Failed to initialize EasyOCR for bbox detection: {e}")

@@ -5,6 +5,20 @@ from PIL import Image, ImageDraw, ImageFont
 import cv2
 import numpy as np
 
+
+# Anchor output to the source directory so saved overlays land in a stable
+# location regardless of the working directory the app was launched from.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _output_path():
+    """Return a fresh, collision-free path under <BASE_DIR>/translated/."""
+    out_dir = os.path.join(BASE_DIR, "translated")
+    os.makedirs(out_dir, exist_ok=True)
+    # Microsecond suffix prevents sub-second recaptures from overwriting output.
+    name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f") + ".png"
+    return os.path.join(out_dir, name)
+
+
 # Fallback font list (used if the user's chosen font is not found)
 FALLBACK_FONTS = [
     "comicbd.ttf",     # Comic Sans MS Bold
@@ -16,53 +30,189 @@ FALLBACK_FONTS = [
     "segoeui.ttf",     # Segoe UI
 ]
 
+# Maps the GUI's font display names to their actual Windows font filenames.
+# PIL's truetype lookup is case-sensitive here ("Arial" fails, "arial.ttf"
+# works), so a display name like "Arial" or "Segoe UI" would otherwise fall
+# through to the fallback list (Comic Sans), silently ignoring the user's choice.
+_FONT_NAME_TO_FILE = {
+    "wild words": "wildwords.ttf",
+    "cc wild words roman": "wildwords.ttf",
+    "anime ace": "animeace.ttf",
+    "comic sans ms": "comic.ttf",
+    "arial": "arial.ttf",
+    "segoe ui": "segoeui.ttf",
+    "ms gothic": "msgothic.ttc",
+    "meiryo": "meiryo.ttc",
+}
+
 def get_font(size, font_name=None):
     """Load a font by name, falling back through a list of common fonts."""
     # Try the user-specified font first
     if font_name:
-        # Try as-is (full path or system-registered name)
-        for attempt in [font_name, font_name + ".ttf", font_name + ".otf", font_name + ".ttc"]:
+        attempts = [font_name, font_name + ".ttf", font_name + ".otf", font_name + ".ttc"]
+        # PIL is case-sensitive on the filename: also try a known display-name
+        # mapping and lowercase/space-stripped variants.
+        mapped = _FONT_NAME_TO_FILE.get(font_name.strip().lower())
+        if mapped:
+            attempts.insert(0, mapped)
+        low = font_name.strip().lower()
+        attempts += [low + ".ttf", low.replace(" ", "") + ".ttf",
+                     low + ".ttc", low.replace(" ", "") + ".ttc"]
+        for attempt in attempts:
             try:
                 return ImageFont.truetype(attempt, size)
             except (IOError, OSError):
                 continue
-    
+
     # Fall back through common fonts
     for fallback in FALLBACK_FONTS:
         try:
             return ImageFont.truetype(fallback, size)
         except (IOError, OSError):
             continue
-    
+
     # Ultimate fallback
     return ImageFont.load_default()
 
-def wrap_text(text, font, max_width):
-    """Simple text wrapping."""
+# Unicode ranges that Latin fonts (e.g. Arial) cannot render -> tofu rectangles.
+import re
+_CJK_RE = re.compile(
+    "[　-〿"   # CJK symbols & punctuation
+    "぀-ゟ"    # Hiragana
+    "゠-ヿ"    # Katakana
+    "㐀-䶿"    # CJK Ext A
+    "一-鿿"    # CJK Unified Ideographs
+    "豈-﫿"    # CJK Compatibility Ideographs
+    "＀-￯"    # Halfwidth/Fullwidth forms (incl. 。！？)
+    "가-힯]"   # Hangul
+)
+
+# CJK-capable fonts that ALSO include Latin glyphs, in preference order.
+_CJK_FONTS = ["meiryo.ttc", "YuGothM.ttc", "YuGothR.ttc", "msgothic.ttc",
+              "msyh.ttc", "malgun.ttf", "simsun.ttc"]
+
+def _has_cjk(text):
+    return bool(_CJK_RE.search(text or ""))
+
+def _get_cjk_font(size):
+    for fname in _CJK_FONTS:
+        try:
+            return ImageFont.truetype(fname, size)
+        except (IOError, OSError):
+            continue
+    return None
+
+# Glyph-coverage cache: {font_path: set_of_codepoints | None}.
+# None means coverage couldn't be determined (fontTools missing/unreadable).
+_cmap_cache = {}
+
+def _font_codepoints(path):
+    if path in _cmap_cache:
+        return _cmap_cache[path]
+    cps = None
+    try:
+        from fontTools.ttLib import TTFont, TTCollection
+        if path.lower().endswith(".ttc"):
+            cps = set()
+            for f in TTCollection(path).fonts:
+                cps |= set(f.getBestCmap().keys())
+        else:
+            cps = set(TTFont(path).getBestCmap().keys())
+    except Exception:
+        cps = None
+    _cmap_cache[path] = cps
+    return cps
+
+def _covers(font, text):
+    """True/False if `font` can render every glyph in `text`; None if unknown."""
+    path = getattr(font, "path", None)
+    if not path:
+        return None
+    cps = _font_codepoints(path)
+    if cps is None:
+        return None
+    for ch in text or "":
+        if ord(ch) < 32:
+            continue
+        if ord(ch) not in cps:
+            return False
+    return True
+
+def get_font_for_text(text, size, font_name=None):
+    """Pick a font that can render EVERY glyph in `text`.
+
+    The user's chosen font (e.g. Arial) is Latin-only and lacks both CJK
+    characters (from untranslated blocks / OCR kana) and many symbols actually
+    present in stream UIs (℃, ☆, ※, ◆ ...). Any uncovered glyph renders as a
+    tofu rectangle. So: if the user font covers the text, use it; otherwise fall
+    back to a broad CJK font (Meiryo et al. cover Latin + CJK + symbols). When
+    fontTools is unavailable, degrade to a CJK-presence heuristic.
+    """
+    user_font = get_font(size, font_name)
+    cov = _covers(user_font, text)
+    if cov is True:
+        return user_font
+    if cov is None:
+        # Coverage undeterminable: use the cheap CJK heuristic.
+        if _has_cjk(text):
+            return _get_cjk_font(size) or user_font
+        return user_font
+    # cov is False -> user font is missing glyphs; find a fallback that covers them.
+    for fname in _CJK_FONTS:
+        try:
+            cand = ImageFont.truetype(fname, size)
+        except (IOError, OSError):
+            continue
+        if _covers(cand, text):
+            return cand
+    return _get_cjk_font(size) or user_font
+
+def _hard_break(token, font, max_width):
+    """Break a single over-wide token into character-level chunks that each fit
+    max_width. Returns (completed_lines, trailing_remainder)."""
     lines = []
+    chunk = ""
+    for ch in token:
+        trial = chunk + ch
+        # Always keep at least one char per line, even if it alone overflows.
+        if chunk and get_text_advance(trial, font) > max_width:
+            lines.append(chunk)
+            chunk = ch
+        else:
+            chunk = trial
+    return lines, chunk
+
+def wrap_text(text, font, max_width):
+    """Wrap text to fit max_width, hard-breaking tokens too long to fit on their
+    own line (long URLs, or space-less CJK runs from untranslated blocks) at the
+    character level so they never overflow the box."""
+    if max_width <= 0 or not text:
+        return [text] if text else []
     words = text.split()
     if not words:
         return []
-        
-    current_line = []
-    
+
+    lines = []
+    current = ""
     for word in words:
-        current_line.append(word)
-        line_str = " ".join(current_line)
-        # Calculate width
-        if hasattr(font, 'getbbox'):
-            w = font.getbbox(line_str)[2]
+        candidate = word if not current else current + " " + word
+        if get_text_advance(candidate, font) <= max_width:
+            current = candidate
+            continue
+        # The candidate doesn't fit: flush the current line first.
+        if current:
+            lines.append(current)
+            current = ""
+        if get_text_advance(word, font) <= max_width:
+            current = word
         else:
-            w = font.getsize(line_str)[0]
-            
-        if w > max_width and len(current_line) > 1:
-            current_line.pop()
-            lines.append(" ".join(current_line))
-            current_line = [word]
-            
-    if current_line:
-        lines.append(" ".join(current_line))
-        
+            # The word itself is wider than the box -> hard-break it.
+            pieces, leftover = _hard_break(word, font, max_width)
+            lines.extend(pieces)
+            current = leftover
+
+    if current:
+        lines.append(current)
     return lines
 
 def is_dark(color):
@@ -165,7 +315,7 @@ def create_overlay(image, extracted_data, font_name=None):
         # Find the largest font size that fits this box
         font_size = max(10, int(height * 0.8))
         while font_size > 8:
-            font = get_font(font_size, font_name)
+            font = get_font_for_text(text, font_size, font_name)
             lines = wrap_text(text, font, width)
             if not lines:
                 break
@@ -192,8 +342,7 @@ def create_overlay(image, extracted_data, font_name=None):
     
     if not box_infos:
         # Save and return as-is if no text is found
-        os.makedirs("translated", exist_ok=True)
-        filepath = os.path.join("translated", datetime.now().strftime("%Y-%m-%d_%H-%M-%S.png"))
+        filepath = _output_path()
         img_copy.save(filepath)
         return filepath
         
@@ -226,7 +375,7 @@ def create_overlay(image, extracted_data, font_name=None):
     # ── Pass 3: Draw text overlays with custom dynamic strokes ──
     for info in box_infos:
         font_size = info["unified_font_size"]
-        font = get_font(font_size, font_name)
+        font = get_font_for_text(info.get("text", ""), font_size, font_name)
         
         if hasattr(font, 'getbbox'):
             line_height = font.getbbox("A")[3] - font.getbbox("A")[1]
@@ -368,14 +517,12 @@ def create_overlay(image, extracted_data, font_name=None):
             
             paste_x = int(cx - rcx)
             paste_y = int(cy - rcy)
-            
+
             # Paste with alpha mask
             img_copy.paste(rotated_txt_img, (paste_x, paste_y), rotated_txt_img)
-            
+
     # Save the file
-    os.makedirs("translated", exist_ok=True)
-    filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.png")
-    filepath = os.path.join("translated", filename)
+    filepath = _output_path()
     img_copy.save(filepath)
-        
+
     return filepath
